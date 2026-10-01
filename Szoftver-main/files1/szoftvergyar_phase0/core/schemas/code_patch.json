@@ -1,0 +1,36 @@
+{
+ "type": "object",
+ "required": ["status", "reason", "edits", "new_files", "ac_covered"],
+ "additionalProperties": false,
+ "properties": {
+  "status": {"type": "string", "enum": ["PATCH", "ESCALATE_HUMAN"]},
+  "reason": {"type": "string", "maxLength": 240},
+  "escalate_kind": {"type": "string", "enum": ["protected_zone", "bad_test", "idea", "dependency", "other"]},
+  "edits": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["path", "search", "replace"],
+    "properties": {
+     "path": {"type": "string", "maxLength": 300},
+     "search": {"type": "string", "maxLength": 20000},
+     "replace": {"type": "string", "maxLength": 20000}
+    }
+   }
+  },
+  "new_files": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["path", "content"],
+    "properties": {
+     "path": {"type": "string", "maxLength": 300},
+     "content": {"type": "string", "maxLength": 40000}
+    }
+   }
+  },
+  "ac_covered": {"type": "array", "items": {"type": "string", "maxLength": 20}}
+ }
+}

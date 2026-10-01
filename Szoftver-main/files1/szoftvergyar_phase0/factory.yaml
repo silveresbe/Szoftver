@@ -1,0 +1,76 @@
+# Szoftvergyár – 0. fázis konfig (a spec 3. fejezetének minimális részhalmaza). Új szekciókat a fázisokkal együtt kell bevezetni.
+factory: { name: "szoftvergyar", version: "1.5-phase0" }
+rollout: { phase: 1 }                     # fázist ember emel (12.1)
+llm_gateway_modes: { mode: mock }         # live | record | replay | mock
+egress_redaction: { data_egress_acknowledged: false, pii_patterns: [email, phone] }   # live módhoz true kell (12.6)
+limits: { total_token_limit: 500000 }
+rate_limit:
+  window_seconds: 60
+  safety_margin: 0.9
+  max_request_share: 0.5
+  max_wait_seconds: 900
+  starvation_aging_seconds: 120
+  max_concurrent_calls: 2                 # a kvóta közös, kevés párhuzamos hívás (7/5)
+  priority_order: [supervisor, security, qa, master_coder, git_devops, db_architect, product_owner, ux_designer, tech_writer]
+  per_model:                              # mintaértékek; a hiteles érték: console.groq.com/settings/limits
+    "llama-3.1-8b-instant":    { rpm: 30, tpm: 6000,  rpd: 14400, tpd: null }
+    "llama-3.3-70b-versatile": { rpm: 30, tpm: 12000, rpd: 1000,  tpd: null }
+    "openai/gpt-oss-120b":     { rpm: 30, tpm: 8000,  rpd: 1000,  tpd: 200000 }
+iteration_policy:
+  caps:
+    S1: { iterations: 3, tokens: 20000 }
+    S2: { iterations: 5, tokens: 60000 }
+    S3: { iterations: 6, tokens: 120000 }
+circuit_breaker: { same_fingerprint_iterations: 3 }
+state_store: { path: state/factory.db }
+audit: { path: audit/decisions.jsonl }
+kill_switch: { file: state/KILL }
+sandbox:
+  runtime: docker
+  oci_runtime: runc                      # runc | runsc; runc-hoz acknowledged_weaker_isolation: true kell
+  on_runtime_unavailable: halt_and_ask_human
+  acknowledged_weaker_isolation: true
+  image: "fsz-gates:1"                    # sh docker/build_gates_image.sh; ruff + mypy előre telepítve (nincs hálózat futáskor)
+  network: none
+  read_only_rootfs: true
+  run_as_user: nobody
+  cpu_limit: "2"
+  memory_limit: "2g"
+  timeout_seconds: 600
+  host_mounts: []
+  hardening: { pids_limit: 256, tmpfs: ["/tmp"] }
+  selftest:
+    on_start: true
+    must_fail: [write_rootfs, outbound_network, read_host_path, mount_syscall, exceed_pids_limit]
+    on_fail: refuse_to_start
+backup:                                   # 12.5; kód, nem ágens
+  targets: ["state/factory.db", "audit/", "evals/recordings/"]   # graph.db a 2. fázisban kerül be
+  method: sqlite_online_backup
+  schedule: { daily: true, after_verified_tag: true }
+  keep: 7
+  path: "state/backups/"
+  restore_drill: { every_days: 30, using: mock_gateway }
+model_tiers:                              # 6.7; a modellnek kell rate_limit.per_model bejegyzés
+  light:    { provider: groq, model: "llama-3.1-8b-instant" }
+  standard: { provider: groq, model: "llama-3.3-70b-versatile" }
+  heavy:    { provider: groq, model: "openai/gpt-oss-120b" }
+agents:                                   # 3. fejezet; ágensenként egyenként kerülnek be
+  product_owner: { tier: standard, max_tokens_per_task: 6000, temperature: 0.3 }
+  master_coder:  { tier: standard, max_tokens_per_task: 20000, temperature: 0.2 }   # a védett zóna listája NEM itt van: tool_gateway.DEFAULT_PROTECTED / tool_permissions.protected_paths (egyetlen forrás)
+ci_pipeline:                              # 11.1/11.2/12.1; determinisztikus kapuk: kemény alapértelmezés, `kind: soft` csak ruff stílus-szabálycsoport (config-ellenőrzött); SAST a saját fázisában
+  gates:
+    - { name: syntax,     argv: ["python", "-m", "compileall", "-q", "."] }
+    - { name: lint,       argv: ["python", "-m", "ruff", "check", "--no-cache", "--output-format=concise", "--select", "F,E9,B,S,PLE", "--ignore", "S101", "."], requires: [ruff] }   # KEMÉNY csoportok (11.2); S101 (assert) a tesztek miatt kivéve
+    - { name: types,      argv: ["python", "-m", "mypy", "--ignore-missing-imports", "--no-error-summary", "--cache-dir=/tmp/.mypy_cache", "."], requires: [mypy] }
+    - { name: unit_tests, argv: ["python", "-m", "unittest", "discover", "-s", "tests", "-t", "."] }
+    - { name: lint_soft,  kind: soft, argv: ["python", "-m", "ruff", "check", "--no-cache", "--output-format=concise", "--select", "E,W,C90,N,SIM,UP,I", "."], requires: [ruff] }   # PUHA csoportok; a D (docstring) szándékosan kimarad: lásd HANDOFF 13. munkamenet
+  autofix: { enabled: true, only_files_in_diff: true, max_touched_lines_outside_diff: 30, counts_as_iteration: false }   # 11.2; LLM nélkül, a kapuk előtt
+  soft_gate:                              # 11.2; a szabálylisták és a never_soft NEM gyengíthetők (config.validate_deep)
+    enabled: true
+    return_soft_to_coder_until_iteration: 1
+    max_soft_findings_returned: 5
+    result_status: GREEN_WITH_DEBT
+    never_soft: [tests, coverage, mutation_score, security_scan_block, type_errors, hard_lint, secrets, license, tech_stack_lock]
+    debt_created_by: ci_code_not_agent
+    debt_intake: { register: "state/tech_debt.jsonl", origin: soft_gate, dedupe_by: [rule, file], max_open_items: 30, on_full: close_soft_gate }
+  staging: { max_mb: 50, exclude: [] }    # a sandboxba csak szűrt másolat megy (tiltott útvonalak, .git, linkek nélkül)
