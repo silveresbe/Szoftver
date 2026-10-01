@@ -2,7 +2,7 @@
 
 Ez nem LLM-ágens, hanem determinisztikus repo-helper. A cél, hogy a későbbi Supervisor
 és a Git/DevOps komponens képes legyen csak a szükséges műveleteket elvégezni: branch,
-checkout, status, add, commit, diff és rollback.
+checkout, status, add, commit, diff, worktree és rollback.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ class GitDevOps:
     Műveletek:
       - repo ellenőrzése / status
       - branch váltás / létrehozás
+      - worktree létrehozás / tisztítás
       - diff / add / commit
       - restore / rollback
     """
@@ -75,6 +76,14 @@ class GitDevOps:
     def current_branch(self) -> str:
         return self._git("branch", "--show-current")
 
+    def branch_exists(self, branch: str) -> bool:
+        """True, ha a branch létezik."""
+        try:
+            self._git("rev-parse", "--verify", branch)
+            return True
+        except GitDevOpsError:
+            return False
+
     def checkout(self, branch: str, *, create: bool = False) -> str:
         """Branch váltás, vagy új branch létrehozása."""
         self.ensure_repo()
@@ -85,6 +94,8 @@ class GitDevOps:
     def create_branch(self, branch: str, start_point: str = "HEAD") -> str:
         """Új branch létrehozása a megadott pontból."""
         self.ensure_repo()
+        if self.branch_exists(branch):
+            return self._git("checkout", branch)
         return self._git("checkout", "-b", branch, start_point)
 
     def add(self, files: Sequence[str] | None = None) -> str:
@@ -101,6 +112,11 @@ class GitDevOps:
             self.add(files)
         else:
             self.add()
+
+        status = self.status()
+        if status["clean"]:
+            return ""
+
         return self._git("commit", "-m", message)
 
     def diff(self, *, cached: bool = False, branch: str | None = None) -> str:
@@ -125,6 +141,24 @@ class GitDevOps:
         """Visszaállítás a ref-re, teljes worktree + index rollback."""
         self.ensure_repo()
         return self._git("reset", "--hard", ref)
+
+    def worktree_add(self, task_id: str, base_ref: str = "HEAD", *, path: str | None = None) -> str:
+        """Új worktree létrehozása egy feladathoz."""
+        self.ensure_repo()
+        worktree_path = path or os.path.join(os.path.dirname(self.repo_root), f"{os.path.basename(self.repo_root)}-{task_id}")
+        if os.path.exists(worktree_path):
+            return worktree_path
+        self._git("worktree", "add", "-f", worktree_path, base_ref)
+        return worktree_path
+
+    def worktree_remove(self, worktree_path: str, *, force: bool = False) -> str:
+        """Worktree eltávolítása."""
+        self.ensure_repo()
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(worktree_path)
+        return self._git(*args)
 
     def log(self, n: int = 5) -> list[str]:
         """Utolsó n commit rövid összefoglalója."""
