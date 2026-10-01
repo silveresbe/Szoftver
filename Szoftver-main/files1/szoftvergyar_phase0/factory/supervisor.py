@@ -19,12 +19,22 @@ class PhaseNotEnabled(RuntimeError):
 class Supervisor:
     """Koordinátor a task lifecycle és a QA handoff között."""
 
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    NEEDS_INFO = "needs_info"
+
     def __init__(self, enabled_phases: set[str] | None = None, audit=None):
         self.enabled_phases = enabled_phases or {"plan", "build", "qa", "handoff"}
         self.audit = audit
 
     def startup(self):
         return {"status": "ok", "enabled_phases": sorted(self.enabled_phases)}
+
+    def check_phase(self, phase: str) -> bool:
+        """Ellenőrzi, hogy a fázis engedélyezett-e."""
+        if phase not in self.enabled_phases:
+            raise PhaseNotEnabled(f"phase '{phase}' is not enabled")
+        return True
 
     def run_qa_handoff(
         self,
@@ -48,7 +58,7 @@ class Supervisor:
         reason = str(qa_result.get("reason") or "No reason provided.")
 
         if status == "ACCEPT":
-            next_state = "accepted"
+            next_state = self.ACCEPTED
             next_action = "handoff_to_owner"
             recipient = "product_owner"
             payload = {
@@ -60,9 +70,9 @@ class Supervisor:
                 "decision": "accept",
             }
         elif status == "REJECT":
-            next_state = "rejected"
+            next_state = self.REJECTED
             next_action = "return_for_revision"
-            recipient = "coder"
+            recipient = "master_coder"
             payload = {
                 "task_id": task_id,
                 "status": "REJECT",
@@ -73,7 +83,7 @@ class Supervisor:
                 "required_fix": "inspect_qa_failures",
             }
         else:
-            next_state = "needs_info"
+            next_state = self.NEEDS_INFO
             next_action = "request_clarification"
             recipient = "product_owner"
             payload = {
@@ -90,7 +100,7 @@ class Supervisor:
             task_id=task_id,
             frm=actor,
             to=recipient,
-            mtype="qa_handoff",
+            mtype="QA_HANDOFF",
             payload=payload,
             iteration=iteration,
             state=next_state,
@@ -109,8 +119,52 @@ class Supervisor:
             "message": message,
         }
 
-    def check_phase(self, phase: str) -> bool:
-        """Ellenőrzi, hogy a fázis engedélyezett-e."""
-        if phase not in self.enabled_phases:
-            raise PhaseNotEnabled(f"phase '{phase}' is not enabled")
-        return True
+    def route_task(
+        self,
+        task_id: str,
+        qa_result: Mapping[str, Any],
+        *,
+        iteration: int = 0,
+        actor: str = "supervisor",
+    ) -> dict[str, Any]:
+        """Végső task route: QA döntésének Supervisor hívása."""
+        decision = self.run_qa_handoff(task_id, qa_result, iteration=iteration, actor=actor)
+
+        if decision["state"] == self.ACCEPTED:
+            return {
+                "task_id": task_id,
+                "route": "accepted",
+                "next_action": "handoff_to_owner",
+                "recipient": "product_owner",
+                "message": decision["message"],
+            }
+        if decision["state"] == self.REJECTED:
+            return {
+                "task_id": task_id,
+                "route": "revision_required",
+                "next_action": "return_for_revision",
+                "recipient": "master_coder",
+                "message": decision["message"],
+            }
+        return {
+            "task_id": task_id,
+            "route": "needs_info",
+            "next_action": "request_clarification",
+            "recipient": "product_owner",
+            "message": decision["message"],
+        }
+
+
+DEFAULT_SUPERVISOR = Supervisor
+
+
+if __name__ == "__main__":
+    sup = Supervisor()
+    print(sup.startup())
+    print(
+        sup.run_qa_handoff(
+            "TASK-001",
+            {"status": "ACCEPT", "score": 1.0, "summary": "OK", "reason": "meets criteria"},
+            iteration=2,
+        )
+    )
