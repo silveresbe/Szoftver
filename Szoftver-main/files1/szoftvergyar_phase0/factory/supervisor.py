@@ -1,8 +1,9 @@
-"""Supervisor integration: handoff from QA to task routing.
+"""Supervisor integration: QA handoff, route selection and task state machine.
 
-Ez a modul a QA döntését a Supervisor által elfogadott, strukturált task-state
-hívásokhoz köti össze. A cél: a pipeline ugyanazt a döntést produkálja, amit a
-logika szándékozik.
+Ez a modul köt össze három dolgot:
+- a QA eredményét,
+- a Supervisor döntését,
+- a task lifecycle explicit állapotátmeneteit.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .messages import make as make_message
+from .task_state import TASK_STATES, TaskStateMachine
 
 
 class PhaseNotEnabled(RuntimeError):
@@ -19,9 +21,9 @@ class PhaseNotEnabled(RuntimeError):
 class Supervisor:
     """Koordinátor a task lifecycle és a QA handoff között."""
 
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
-    NEEDS_INFO = "needs_info"
+    ACCEPTED = TASK_STATES["ACCEPTED"]
+    REJECTED = TASK_STATES["REJECTED"]
+    NEEDS_INFO = TASK_STATES["NEEDS_INFO"]
 
     def __init__(self, enabled_phases: set[str] | None = None, audit=None):
         self.enabled_phases = enabled_phases or {"plan", "build", "qa", "handoff"}
@@ -36,7 +38,7 @@ class Supervisor:
             raise PhaseNotEnabled(f"phase '{phase}' is not enabled")
         return True
 
-    def run_qa_handoff(
+    def route_qa_decision(
         self,
         task_id: str,
         qa_result: Mapping[str, Any],
@@ -44,23 +46,16 @@ class Supervisor:
         iteration: int = 0,
         actor: str = "supervisor",
     ) -> dict[str, Any]:
-        """A QA döntését konvertálja Supervisor state-re / message-re.
-
-        A visszatérési payload tartalmazza a végső task állapotot, a következő
-        akciót és a handoff-t a Product Owner vagy a Coder felé.
-        """
+        """QA döntését fordítja állapotgépi route-ra és üzenetre."""
         if not task_id:
             raise ValueError("task_id cannot be empty")
 
-        status = str(qa_result.get("status", "NEEDS_INFO")).upper()
-        score = float(qa_result.get("score", 0.0) or 0.0)
-        summary = str(qa_result.get("summary") or "QA review completed.")
-        reason = str(qa_result.get("reason") or "No reason provided.")
+        state, next_action, recipient = TaskStateMachine.qa_decision_to_state(qa_result)
+        score = float((qa_result or {}).get("score", 0.0) or 0.0)
+        summary = str((qa_result or {}).get("summary") or "QA review completed.")
+        reason = str((qa_result or {}).get("reason") or "No reason provided.")
 
-        if status == "ACCEPT":
-            next_state = self.ACCEPTED
-            next_action = "handoff_to_owner"
-            recipient = "product_owner"
+        if state == self.ACCEPTED:
             payload = {
                 "task_id": task_id,
                 "status": "ACCEPT",
@@ -69,10 +64,7 @@ class Supervisor:
                 "reason": reason,
                 "decision": "accept",
             }
-        elif status == "REJECT":
-            next_state = self.REJECTED
-            next_action = "return_for_revision"
-            recipient = "master_coder"
+        elif state == self.REJECTED:
             payload = {
                 "task_id": task_id,
                 "status": "REJECT",
@@ -83,9 +75,6 @@ class Supervisor:
                 "required_fix": "inspect_qa_failures",
             }
         else:
-            next_state = self.NEEDS_INFO
-            next_action = "request_clarification"
-            recipient = "product_owner"
             payload = {
                 "task_id": task_id,
                 "status": "NEEDS_INFO",
@@ -93,7 +82,7 @@ class Supervisor:
                 "summary": summary,
                 "reason": reason,
                 "decision": "needs_info",
-                "required_input": qa_result.get("evidence") or {},
+                "required_input": (qa_result or {}).get("evidence") or {},
             }
 
         message = make_message(
@@ -103,23 +92,22 @@ class Supervisor:
             mtype="QA_HANDOFF",
             payload=payload,
             iteration=iteration,
-            state=next_state,
+            state=state,
             action=next_action,
         )
 
         return {
             "task_id": task_id,
-            "state": next_state,
-            "status": status,
-            "score": round(max(0.0, min(1.0, score)), 3),
+            "state": state,
             "next_action": next_action,
             "recipient": recipient,
+            "score": round(max(0.0, min(1.0, score)), 3),
             "summary": summary,
             "reason": reason,
             "message": message,
         }
 
-    def route_task(
+    def run_qa_handoff(
         self,
         task_id: str,
         qa_result: Mapping[str, Any],
@@ -127,31 +115,38 @@ class Supervisor:
         iteration: int = 0,
         actor: str = "supervisor",
     ) -> dict[str, Any]:
-        """Végső task route: QA döntésének Supervisor hívása."""
-        decision = self.run_qa_handoff(task_id, qa_result, iteration=iteration, actor=actor)
+        """Alias a route_qa_decision számára; kompatibilitás miatt megtartva."""
+        return self.route_qa_decision(task_id, qa_result, iteration=iteration, actor=actor)
 
-        if decision["state"] == self.ACCEPTED:
+    def transition(self, current_state: str, event: str) -> str:
+        """Explicit task state transition wrapper."""
+        return TaskStateMachine.transition(current_state, event)
+
+    def route_task(self, task_id: str, qa_result: Mapping[str, Any], *, iteration: int = 0, actor: str = "supervisor") -> dict[str, Any]:
+        """Végső task route: QA döntésének Supervisor hívása."""
+        result = self.route_qa_decision(task_id, qa_result, iteration=iteration, actor=actor)
+        if result["state"] == self.ACCEPTED:
             return {
                 "task_id": task_id,
                 "route": "accepted",
                 "next_action": "handoff_to_owner",
                 "recipient": "product_owner",
-                "message": decision["message"],
+                "message": result["message"],
             }
-        if decision["state"] == self.REJECTED:
+        if result["state"] == self.REJECTED:
             return {
                 "task_id": task_id,
                 "route": "revision_required",
                 "next_action": "return_for_revision",
                 "recipient": "master_coder",
-                "message": decision["message"],
+                "message": result["message"],
             }
         return {
             "task_id": task_id,
             "route": "needs_info",
             "next_action": "request_clarification",
             "recipient": "product_owner",
-            "message": decision["message"],
+            "message": result["message"],
         }
 
 
@@ -162,7 +157,7 @@ if __name__ == "__main__":
     sup = Supervisor()
     print(sup.startup())
     print(
-        sup.run_qa_handoff(
+        sup.route_qa_decision(
             "TASK-001",
             {"status": "ACCEPT", "score": 1.0, "summary": "OK", "reason": "meets criteria"},
             iteration=2,
