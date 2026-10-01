@@ -9,6 +9,7 @@ from . import splitter
 from .sandbox import SandboxRefused
 from .gates import StageTooLarge, GateToolsMissing, fingerprint as gate_fingerprint
 from .lane_classifier import LaneClassifier
+from .qa import QA
 
 DEFAULT_CAPS = {"S1": {"iterations": 3, "tokens": 20000}, "S2": {"iterations": 5, "tokens": 60000}, "S3": {"iterations": 6, "tokens": 120000}}
 
@@ -227,8 +228,32 @@ class Supervisor:
             self.state.update_task_data(task_id, human_decision=None)
         return self.accept_patch(task_id, res)
 
+    def review_task(self, task_id, spec, files=(), qa=None, test_results=None, feedback=None):
+        """QA review bekötése a pipelineba."""
+        if qa is None:
+            return "QA_SKIPPED"
+        patch = {}
+        for path in files:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    patch[path] = f.read()
+            except Exception:
+                patch[path] = ""
+        result = qa.run(task_id, spec, patch, test_results=test_results, feedback=feedback,
+                        iteration=self.state.get_task(task_id)["iteration"])
+        if result.get("verdict") == "REJECT":
+            self.state.upsert_task(task_id, "WAITING_HUMAN")
+            self.escalate(task_id, "QA review elutasította a patchet: " + "; ".join(
+                str(x.get("message", "")) for x in result.get("findings", [])[:3] if x.get("message")
+            )[:400], options=("javítás és új QA", "spec pontosítása", "szál elvetése"))
+            return "ESCALATED"
+        self.state.checkpoint(task_id, "QA_APPROVED", {"files": list(files), "findings": result.get("findings", [])})
+        self.state.upsert_task(task_id, "QA_APPROVED")
+        self.audit.append("supervisor", "QA_APPROVED", {"task_id": task_id, "confidence": result.get("confidence", 0)})
+        return "APPROVED"
+
     # --- Coder -> kapuk -> javítási hurok (2.1, 4.2, 11.3) ---
-    def drive(self, task_id, coder, gates, files=(), autofix=None, debt=None) -> str:
+    def drive(self, task_id, coder, gates, files=(), autofix=None, debt=None, qa=None, test_results=None) -> str:
         """READY spec -> Coder -> determinisztikus kapuk; bukásnál a hibasorok visszamennek a Codernek.
         Visszatér: 'GREEN' | 'GREEN_WITH_DEBT' | 'NOT_READY' | 'PAUSED' | 'ESCALATED' | 'HALT' | 'CAP'."""
         files, feedback, orig_model = list(files), None, getattr(coder, "model", None)
@@ -254,6 +279,15 @@ class Supervisor:
                 if g["ok"] and g.get("soft"):
                     g, debt_n = self._soft_gate(task_id, g, debt)
                 if g["ok"]:
+                    if qa is not None:
+                        spec_path = self.state.get_task_data(task_id).get("spec_path")
+                        if spec_path:
+                            with open(spec_path, "r", encoding="utf-8") as f:
+                                spec = json.load(f)
+                            qres = self.review_task(task_id, spec, files=files, qa=qa,
+                                                    test_results=test_results, feedback=feedback)
+                            if qres == "ESCALATED":
+                                return "ESCALATED"
                     if debt_n:
                         self.state.checkpoint(task_id, "GATES_GREEN", {"files": files, "debt": debt_n})
                         self.state.upsert_task(task_id, "GATES_GREEN_WITH_DEBT")
@@ -299,15 +333,15 @@ class Supervisor:
         if self.metrics: self.metrics.factory("soft_debt_created", res["added"], task_id=task_id)
         return {**g, "soft": []}, len(soft)
 
-    def run_pipeline(self, task_id, request, po, coder, gates, files=(), lane="S2", autofix=None, debt=None) -> str:
-        """Kérés -> Product Owner -> Coder -> kapuk."""
+    def run_pipeline(self, task_id, request, po, coder, gates, files=(), lane="S2", autofix=None, debt=None, qa=None, test_results=None) -> str:
+        """Kérés -> Product Owner -> Coder -> kapuk -> QA."""
         if self.state.get_task(task_id) is None:
             if self.add_task(task_id, lane=lane) == "WAITING_HUMAN":
                 return "ESCALATED"
         r = self.accept_spec(task_id, po.run(task_id, request))
         if r != "READY":
             return r
-        return self.drive(task_id, coder, gates, files, autofix=autofix, debt=debt)
+        return self.drive(task_id, coder, gates, files, autofix=autofix, debt=debt, qa=qa, test_results=test_results)
 
     # --- iteráció, Circuit Breaker, haladásfigyelés (4.2, 11.3) ---
     def record_iteration(self, task_id, fingerprint: str, errors: set | None = None, diff: str = "", files: tuple = (), counts: bool = True):
