@@ -6,7 +6,8 @@ MESSAGE_TYPES = {
     "TASK_ASSIGN", "SPEC_READY", "SCHEMA_READY", "CODE_SUBMITTED", "SECURITY_RESULT", "REVIEW_RESULT", "CI_RESULT",
     "DOCS_READY", "ESCALATE_HUMAN", "HALT", "ROLLBACK_DONE", "PROPOSED_MODULE_CHANGE", "PROPOSED_CONFIG_CHANGE",
     "MODULE_APPLIED", "MODULE_REVERTED", "DESIGN_READY", "CONTEXT_PACK", "ALERT", "INCIDENT_TICKET", "DEBT_TASK",
-    "LANE_CHANGED", "NO_PROGRESS", "INGRESS_QUARANTINE", "FIX_CACHE_HIT", "TESTS_READY", "DOR_FAILED", "AUDIT_CHAIN_BROKEN",
+    "LANE_CHANGED", "NO_PROGRESS", "INGRESS_QUARANTINE", "FIX_CACHE_HIT", "TESTS_READY", "DOR_FAILED",
+    "AUDIT_CHAIN_BROKEN", "QA_HANDOFF",
 }
 AGENTS = {"supervisor", "product_owner", "master_coder", "security", "qa", "git_devops", "db_architect", "tech_writer", "ux_designer", "human", "system"}
 
@@ -68,3 +69,4 @@ def schema_errors(data, schema: dict, path: str = "$") -> list[str]:
 
 def dumps(m: dict) -> str:
     return json.dumps(m, ensure_ascii=False, sort_keys=True)
+
