@@ -57,21 +57,23 @@ def _shape(b, i, lim):
 
 
 def _norm(path):
-    """(normalizált relatív útvonal, hiba)."""
+    """(normalizált relatív útvonal, hiba). Windows és Unix útvonalakat is elfogad."""
     if not isinstance(path, str) or not path.strip():
         return None, "üres útvonal"
     if "\x00" in path or path != path.strip():
         return None, "tiltott karakter az útvonalban"
-    # A repo az útvonalakat relatív, '/'-al vagy '\\'-el is elfogadja, de a belső formátum mindig normalizált,
-    # a Windows-os, fájlnévtérrel való path-mátrix miatt. A relatív útvonal soha ne tartalmazzon abszolút prefixedet.
-    raw = path.replace("\\", "/")
-    if raw.startswith("/") or raw.startswith("//") or re.match(r"^[A-Za-z]:", raw):
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
         return None, "abszolút útvonal"
-    if raw.endswith("/"):
+    if normalized.endswith("/"):
         return None, "könyvtár, nem fájl"
-    p = os.path.normpath(raw).replace("\\", "/")
+    p = normalized
     if p in (".", "..") or p.startswith("../"):
         return None, "kilépés a munkakönyvtárból"
+    parts = p.split("/")
+    for part in parts:
+        if part == "..":
+            return None, "kilépés a munkakönyvtárból"
     return p, None
 
 
@@ -80,11 +82,25 @@ def norm_path(path):
     return _norm(path)
 
 
-def _canon_path(path):
-    """A valós és a hozzárendelt útvonal összehasonlításához ugyanaz a normalizálás kell mindkét oldalon."""
-    if path is None:
-        return None
-    return os.path.normcase(os.path.normpath(path))
+def _is_safe_path(expected, real_root):
+    """Ellenőrzi, hogy az expected útvonal a real_root alatt van és nem szimbolikus link.
+    Windows alatt kezeli a case-insensitive fájlrendszert."""
+    try:
+        expected_abs = os.path.abspath(expected)
+        root_abs = os.path.abspath(real_root)
+        if os.name == 'nt':
+            expected_abs = expected_abs.lower()
+            root_abs = root_abs.lower()
+        if not (expected_abs.startswith(root_abs + os.sep) or expected_abs == root_abs):
+            return False
+        current = expected_abs
+        while current != root_abs and current != os.path.dirname(current):
+            if os.path.islink(current):
+                return False
+            current = os.path.dirname(current)
+        return True
+    except Exception:
+        return False
 
 
 def read_file(root, rel, limits=None):
@@ -96,8 +112,8 @@ def read_file(root, rel, limits=None):
         return None, ("BAD_PATH", e)
     if any(part.lower() == ".git" for part in rel_n.split("/")):
         return None, ("DENIED", ".git tiltott")
-    expected = os.path.normpath(os.path.join(os.path.realpath(root), rel_n))
-    if _canon_path(os.path.realpath(expected)) != _canon_path(expected):
+    expected = os.path.join(os.path.realpath(root), rel_n.replace("/", os.sep))
+    if not _is_safe_path(expected, os.path.realpath(root)):
         return None, ("BAD_PATH", "szimbolikus link vagy a munkakönyvtárból kilépő útvonal")
     if not os.path.lexists(expected):
         return None, ("NOT_FOUND", "a fájl nem létezik")
@@ -111,16 +127,16 @@ def _access(rel, tools, agent, audit, real_root):
         if log:
             log.append(agent, "TOOL_DENIED", {"tool": "repo_write", "path": rel, "via": "git_dir"})
         return "DENIED", ".git tiltott"
-    if tools.is_protected(rel.lower()) and not tools.is_protected(rel):      # kis/nagybetű-játék ellen
+    if tools.is_protected(rel.lower()) and not tools.is_protected(rel):
         if log:
             log.append(agent, "TOOL_DENIED", {"tool": "repo_write", "path": rel, "via": "casefold"})
         return "DENIED", "védett zóna"
     try:
-        tools.authorize(agent, "repo_write", rel)        # jogosultság + védett zóna + kill switch (Killed továbbmegy)
+        tools.authorize(agent, "repo_write", rel)
     except ToolDenied:
         return "DENIED", "nincs jogosultság vagy védett zóna"
-    expected = os.path.normpath(os.path.join(real_root, rel))
-    if _canon_path(os.path.realpath(expected)) != _canon_path(expected):
+    expected = os.path.join(real_root, rel.replace("/", os.sep))
+    if not _is_safe_path(expected, real_root):
         return "BAD_PATH", "szimbolikus link vagy a munkakönyvtárból kilépő útvonal"
     return None
 
@@ -154,7 +170,7 @@ def hunk_context(text, search, radius=5, max_chars=1200):
     key = next((l.strip() for l in s_lines if l.strip()), "")
     if not key or not lines:
         return ""
-    best_i, best = -1, (0.0, 0)                     # (hasonlóság, leghosszabb közös részlet): döntetlennél az utóbbi dönt
+    best_i, best = -1, (0.0, 0)
     for i, l in enumerate(lines):
         l = l.strip()
         sm = difflib.SequenceMatcher(None, key, l)
@@ -174,7 +190,7 @@ def hunk_context(text, search, radius=5, max_chars=1200):
     def render():
         return "\n".join((numbered[n] if numbered else f"{n + 1}: {lines[n]}") for n in range(lo, hi))
     out = render()
-    while len(out) > max_chars and hi - lo > 1:              # a legjobb találat körül szűkítünk, nem a végéről vágunk
+    while len(out) > max_chars and hi - lo > 1:
         if best_i - lo > hi - 1 - best_i:
             lo += 1
         else:
@@ -186,11 +202,11 @@ def hunk_context(text, search, radius=5, max_chars=1200):
 def _edit(text, search, replace):
     """(új szöveg, hiba). Hiba: (kód, részlet, context)."""
     if "\r\n" in text and text.count("\n") == text.count("\r\n") and "\r" not in search and "\r" not in replace:
-        search, replace = search.replace("\n", "\r\n"), replace.replace("\n", "\r\n")  # CRLF-fájl
+        search, replace = search.replace("\n", "\r\n"), replace.replace("\n", "\r\n")
     first = text.find(search)
     if first < 0:
         return None, ("SEARCH_NOT_FOUND", "a 'search' szöveg nem található a fájlban", hunk_context(text, search))
-    second = text.find(search, first + 1)             # átfedő találatok is kétértelműek
+    second = text.find(search, first + 1)
     if second >= 0:
         lines, pos = [], first
         while pos >= 0 and len(lines) < 10:
@@ -201,15 +217,13 @@ def _edit(text, search, replace):
     return text[:first] + replace + text[first + len(search):], None
 
 
-# ---------- alkalmazás ----------
-
 def _commit(real_root, plan):
     """plan: [(rel, orig|None, new)]. Hiba esetén visszaállít és továbbdob."""
     done, made_dirs = [], []
     tmp = None
     try:
         for rel, orig, new in plan:
-            full = os.path.join(real_root, rel)
+            full = os.path.join(real_root, rel.replace("/", os.sep))
             d = os.path.dirname(full)
             if orig is None:
                 missing = []
@@ -236,12 +250,12 @@ def _commit(real_root, plan):
         if tmp and os.path.exists(tmp):
             os.remove(tmp)
         for rel, orig in reversed(done):
-            full = os.path.join(real_root, rel)
+            full = os.path.join(real_root, rel.replace("/", os.sep))
             if orig is None:
                 if os.path.exists(full):
                     os.remove(full)
             else:
-                with open(full, "wb") as f:                  # a mód változatlan (copymode), csak a tartalom áll vissza
+                with open(full, "wb") as f:
                     f.write(orig.encode("utf-8"))
         for m in reversed(made_dirs):
             try:
@@ -297,14 +311,14 @@ def apply_patch(blocks, root, tools, agent=AGENT, audit=None, dry_run=False, lim
         if e:
             errors.append(_err(i, path, "BAD_PATH", e))
             continue
-        if rel in failed:                       # a fájl első hibája után a további blokkjai félrevezető hibát adnának
+        if rel in failed:
             continue
         st = files.get(rel)
         if st is None:
             bad = _access(rel, tools, agent, audit, real_root)
             if bad:
                 errors.append(_err(i, rel, *bad)); failed.add(rel); continue
-            full = os.path.join(real_root, rel)
+            full = os.path.join(real_root, rel.replace("/", os.sep))
             if os.path.lexists(full):
                 text, rerr = _read(full, lim)
                 if rerr:
@@ -344,7 +358,7 @@ def apply_patch(blocks, root, tools, agent=AGENT, audit=None, dry_run=False, lim
         return result
     kill = getattr(tools, "kill", None)
     if kill:
-        kill.check()                            # utolsó kill-ellenőrzés az írás előtt (6.9)
+        kill.check()
     try:
         _commit(real_root, plan)
     except BaseException as ex:
