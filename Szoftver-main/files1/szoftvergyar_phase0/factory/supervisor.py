@@ -8,6 +8,7 @@ from .rate_limiter import DailyQuotaExhausted, WaitTooLong, RequestTooLarge
 from . import splitter
 from .sandbox import SandboxRefused
 from .gates import StageTooLarge, GateToolsMissing, fingerprint as gate_fingerprint
+from .lane_classifier import LaneClassifier
 
 DEFAULT_CAPS = {"S1": {"iterations": 3, "tokens": 20000}, "S2": {"iterations": 5, "tokens": 60000}, "S3": {"iterations": 6, "tokens": 120000}}
 
@@ -26,6 +27,7 @@ class Supervisor:
         self.total_tokens = 0
         self.halted = False
         self.history: dict[str, list[dict]] = {}
+        self.lane_classifier = LaneClassifier()
 
     # --- indulás ---
     def startup(self):
@@ -49,7 +51,18 @@ class Supervisor:
             raise PhaseNotEnabled(f"{name} nincs engedélyezve a(z) {self.phase}. fázisban")
 
     # --- feladatgráf ---
-    def add_task(self, task_id, deps=(), lane="S2", data=None):
+    def add_task(self, task_id, deps=(), lane=None, data=None, task=None):
+        if lane is None or lane not in self.caps:
+            source = data or {}
+            if task is None:
+                for key in ("task", "description", "summary", "title", "text"):
+                    value = source.get(key)
+                    if value is not None:
+                        task = value
+                        break
+            lane = self.lane_classifier.classify(task or source, default="S2")
+        elif lane not in self.caps:
+            raise ValueError(f"ismeretlen lane: {lane}")
         cap = self.caps[lane]
         if lane == "S3" and "security" not in components_allowed(self.phase):
             self.state.upsert_task(task_id, "WAITING_HUMAN", lane=lane, iteration_cap=cap["iterations"], token_cap=cap["tokens"], deps=list(deps), data=data or {})
