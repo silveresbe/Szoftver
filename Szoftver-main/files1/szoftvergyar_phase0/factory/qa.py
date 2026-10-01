@@ -1,249 +1,292 @@
-"""QA & Reviewer ágens (2.4) – determinisztikus + mock LLM rész."""
-from __future__ import annotations
-import json, re
-from . import messages as M
+"""QA review gate: determinisztikus elfogadási logika a patch-ekhez.
 
-class QAError(Exception):
-    pass
+A QA modul a patchet a feladat specifikáció és a tesztfutás alapján értékeli. A
+cél a döntés egyszerű, reprodukálható formában történő visszaadása:
+- ACCEPT: a patch megfelel a kritériumoknak
+- REJECT: a patchet el kell utasítani
+- NEEDS_INFO: a QA további információt kér
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+
+class QAError(RuntimeError):
+    """A QA modulhoz tartozó determinisztikus hiba."""
+
 
 class QA:
-    """QA & Reviewer ágens: spec vs patch ellenőrzés, test coverage, output contract."""
-    
-    def __init__(self, cfg, gateway=None, audit=None, state=None, supervisor=None):
-        self.cfg = cfg
-        self.gateway = gateway
+    """A patch értékelő kapu. A QA a különböző köztes eredményeket egyetlen
+    strukturált döntéssé birodalítja.
+    """
+
+    ACCEPT = "ACCEPT"
+    REJECT = "REJECT"
+    NEEDS_INFO = "NEEDS_INFO"
+
+    def __init__(self, audit=None):
         self.audit = audit
-        self.state = state
-        self.supervisor = supervisor
-    
-    def run(self, task_id: str, spec: dict, patch_files: dict, test_results: dict | None = None, 
-            iteration: int = 0, feedback: str | None = None) -> dict:
+
+    def run(
+        self,
+        task_id: str,
+        spec: dict[str, Any],
+        patch_files: dict[str, Any] | Sequence[str] | None,
+        test_results: dict[str, Any] | None = None,
+        iteration: int = 0,
+        feedback: str | None = None,
+    ) -> dict[str, Any]:
+        """Futtassa le a QA értékelést a feladathoz.
+
+        Visszatérési forma:
+        {
+            "task_id": ...,
+            "status": "ACCEPT|REJECT|NEEDS_INFO",
+            "iteration": ...,
+            "score": 0.0-1.0,
+            "summary": "...",
+            "reason": "...",
+            "missing_files": [...],
+            "failing_tests": [...],
+            "passed_tests": [...],
+            "evidence": {...},
+            "feedback": "..."
+        }
         """
-        QA futtatás: spec + patch ellenőrzés.
-        patch_files: {fájl: tartalom}
-        test_results: {file: {passed: N, failed: N, errors: []}}
-        Visszatér: {status: 'APPROVE'|'REJECT', findings: [], confidence: 0..1}
-        """
-        findings = []
-        confidence = 1.0
-        
-        # 1. Spec vs AC ellenőrzés
-        ac_coverage = self._check_ac_coverage(spec, patch_files)
-        if ac_coverage["uncovered"]:
-            findings.append({
-                "severity": "high",
-                "type": "ac_uncovered",
-                "message": f"AC-k fedetlen: {', '.join(ac_coverage['uncovered'][:3])}",
-                "count": len(ac_coverage["uncovered"])
-            })
-            confidence -= 0.3
-        
-        # 2. Teszteredmények
-        if test_results:
-            test_check = self._check_tests(test_results)
-            if test_check["failed"] > 0:
-                findings.append({
-                    "severity": "high",
-                    "type": "test_failure",
-                    "message": f"{test_check['failed']} teszt sikertelen",
-                    "failed_tests": test_check.get("failures", [])[:5]
-                })
-                confidence -= 0.4
-            elif test_check["coverage"] and test_check["coverage"] < 0.7:
-                findings.append({
-                    "severity": "medium",
-                    "type": "low_coverage",
-                    "message": f"Alacsony test coverage: {test_check['coverage']:.0%}",
-                    "coverage": test_check["coverage"]
-                })
-                confidence -= 0.1
-        
-        # 3. Spec konzisztencia (vague words, scope out megsértés)
-        spec_check = self._check_spec_consistency(spec, patch_files)
-        if spec_check["violations"]:
-            findings.extend(spec_check["violations"])
-            confidence -= len(spec_check["violations"]) * 0.05
-        
-        # 4. Mock LLM review (ha gateway van)
-        if self.gateway and iteration < 2:  # csak az első 2 iteráción
-            try:
-                llm_review = self._gateway_review(task_id, spec, patch_files, findings, feedback)
-                if llm_review.get("additional_findings"):
-                    findings.extend(llm_review["additional_findings"])
-                    confidence = llm_review.get("confidence", confidence)
-            except Exception as e:
-                if self.audit:
-                    self.audit.append("qa", "REVIEW_ERROR", {"task_id": task_id, "error": str(e)})
-        
-        # 5. Döntés
-        confidence = max(0, min(1, confidence))
-        verdict = "APPROVE" if confidence >= 0.7 and not findings else "REJECT"
-        
-        result = {
-            "task_id": task_id,
-            "status": "QA_DONE",
-            "verdict": verdict,
-            "findings": findings,
-            "confidence": confidence,
-            "iteration": iteration,
-            "tokens_used": 0
-        }
-        
-        if self.audit:
-            self.audit.append("qa", "REVIEW_DONE", {
-                "task_id": task_id,
-                "verdict": verdict,
-                "findings_count": len(findings)
-            })
-        
-        if self.state and self.supervisor:
-            self.state.bus_put("supervisor", task_id, M.dumps(M.make(
-                task_id, "qa", "supervisor", "REVIEW_RESULT",
-                {"findings": findings[:10], "verdict": verdict},
-                iteration=iteration
-            )))
-        
-        return result
-    
-    def _check_ac_coverage(self, spec: dict, patch_files: dict) -> dict:
-        """Acceptance Criteria fedettség ellenőrzése."""
-        acs = spec.get("acceptance_criteria", [])
-        uncovered = []
-        
-        patch_text = "\n".join(patch_files.values()) if patch_files else ""
-        
-        for ac in acs:
-            ac_id = ac.get("id", "")
-            # Nagyon egyszerű heurisztika: a teszt fájlban vagy a kódban van-e AC riferencia
-            if ac_id not in patch_text and ac.get("kind") == "happy":
-                # Happy path AC-k kötelezőek
-                uncovered.append(ac_id)
-        
-        return {"uncovered": uncovered, "total": len(acs)}
-    
-    def _check_tests(self, test_results: dict) -> dict:
-        """Test eredmények feldolgozása."""
-        total_passed = 0
-        total_failed = 0
-        total_coverage = 0
-        coverage_count = 0
-        failures = []
-        
-        for file, result in test_results.items():
-            passed = result.get("passed", 0)
-            failed = result.get("failed", 0)
-            total_passed += passed
-            total_failed += failed
-            
-            if failed > 0:
-                failures.append(f"{file}: {failed} hiba")
-            
-            if "coverage" in result:
-                total_coverage += result["coverage"]
-                coverage_count += 1
-        
-        avg_coverage = total_coverage / coverage_count if coverage_count > 0 else None
-        
-        return {
-            "passed": total_passed,
-            "failed": total_failed,
-            "coverage": avg_coverage,
-            "failures": failures
-        }
-    
-    def _check_spec_consistency(self, spec: dict, patch_files: dict) -> dict:
-        """Spec vs patch konzisztencia."""
-        violations = []
-        patch_text = "\n".join(patch_files.values()) if patch_files else ""
-        
-        # Scope_out ellenőrzés: nem szabad benne lennie a patchben
-        scope_out = spec.get("scope_out", [])
-        for item in scope_out:
-            if item.lower() in patch_text.lower():
-                violations.append({
-                    "severity": "high",
-                    "type": "scope_violation",
-                    "message": f"Scope out megsértés: '{item}' a patchben"
-                })
-        
-        # Vague acceptance criteria ellenőrzése
-        acs = spec.get("acceptance_criteria", [])
-        vague_words = self._find_vague_words(acs)
-        if vague_words:
-            violations.append({
-                "severity": "medium",
-                "type": "vague_spec",
-                "message": f"Homályos szavak az AC-ben: {', '.join(vague_words[:3])}",
-                "words": vague_words
-            })
-        
-        return {"violations": violations}
-    
-    def _find_vague_words(self, acs: list) -> list:
-        """Homályos szavak keresése (valósító nélkül)."""
-        vague = {"gyorsan", "jól", "stabilan", "könnyen", "rugalmasan", "hatékonyan", 
-                "user-friendly", "intuitive", "robust", "scalable"}
-        found = []
-        
-        for ac in acs:
-            for field in ("given", "when", "then"):
-                text = ac.get(field, "").lower()
-                for word in vague:
-                    if word in text and not any(c.isdigit() for c in text):
-                        found.append(word)
-        
-        return list(set(found))
-    
-    def _gateway_review(self, task_id: str, spec: dict, patch_files: dict, 
-                       findings: list, feedback: str | None) -> dict:
-        """Mock LLM review a Gatewayen keresztül."""
-        if not self.gateway:
-            return {}
-        
-        # Prompt szerkesztés
-        prompt_text = f"""Áttekintés szükséges:
+        if not isinstance(spec, Mapping):
+            raise QAError("spec must be a mapping / dict")
 
-Spec (AC-k):
-{json.dumps(spec.get('acceptance_criteria', [])[:2], ensure_ascii=False)}
+        if not task_id:
+            raise QAError("task_id cannot be empty")
 
-Módosított fájlok ({len(patch_files)} db):
-{json.dumps({k: v[:200] + '...' if len(v) > 200 else v for k, v in list(patch_files.items())[:2]}, ensure_ascii=False)}
+        files = self._normalize_patch_files(patch_files)
+        tests = self._normalize_test_results(test_results)
+        required_files = self._as_list(spec.get("required_files") or spec.get("files") or spec.get("must_modify"))
+        required_tests = self._as_list(spec.get("required_tests") or spec.get("tests"))
+        acceptance = self._as_list(spec.get("acceptance_criteria"))
 
-Eddig talált problémák: {len(findings)}
+        missing_files = self._missing_required_files(files, required_files)
+        missing_tests = self._missing_required_tests(tests, required_tests)
+        failing_tests = self._failing_tests(tests)
+        passed_tests = self._passed_tests(tests)
 
-Döntsd el: APPROVE vagy REJECT? Rövid indoklás."""
-        
-        schema = {
-            "type": "object",
-            "required": ["verdict"],
-            "properties": {
-                "verdict": {"type": "string", "enum": ["APPROVE", "REJECT"]},
-                "reason": {"type": "string", "maxLength": 200},
-                "additional_issues": {"type": "array", "items": {"type": "string"}}
-            }
-        }
-        
-        try:
-            response = self.gateway.call(
-                "qa", "llama-3.3-70b-versatile",
-                [{"role": "user", "content": prompt_text}],
-                max_output_tokens=300,
-                schema=schema
+        if missing_files:
+            return self._decision(
+                task_id,
+                status=self.REJECT,
+                iteration=iteration,
+                score=0.0,
+                summary="A patch hiányzó fájlokat nem tartalmaz.",
+                reason=f"Hiányzó fájlok: {', '.join(missing_files)}",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"required_files": required_files, "patch_files": files},
+                feedback=feedback,
             )
-            data = response.get("data", {})
-            
-            additional = []
-            for issue in data.get("additional_issues", [])[:3]:
-                additional.append({
-                    "severity": "medium",
-                    "type": "llm_review",
-                    "message": issue
-                })
-            
-            return {
-                "additional_findings": additional,
-                "confidence": 0.9 if data.get("verdict") == "APPROVE" else 0.5,
-                "tokens": response.get("tokens", 0)
-            }
-        except Exception as e:
+
+        if failing_tests:
+            return self._decision(
+                task_id,
+                status=self.REJECT,
+                iteration=iteration,
+                score=max(0.0, 1.0 - (len(failing_tests) / max(1, len(failing_tests) + len(passed_tests))),
+                ),
+                summary="A patch nem felel meg a tesztkritériumoknak.",
+                reason=f"Hibás tesztek: {', '.join(failing_tests)}",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"test_results": tests, "acceptance_criteria": acceptance},
+                feedback=feedback,
+            )
+
+        if missing_tests:
+            return self._decision(
+                task_id,
+                status=self.NEEDS_INFO,
+                iteration=iteration,
+                score=0.5,
+                summary="A patch még hiányzik a kötelező ellenőrzésekhez.",
+                reason=f"Hiányzó kötelező tesztek: {', '.join(missing_tests)}",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"required_tests": required_tests, "test_results": tests},
+                feedback=feedback,
+            )
+
+        if acceptance and not self._acceptance_met(acceptance, files, tests):
+            return self._decision(
+                task_id,
+                status=self.NEEDS_INFO,
+                iteration=iteration,
+                score=0.6,
+                summary="A patch nem teljesíti az explicit acceptancia kritériumokat.",
+                reason="Néhány acceptancia feltétel nem ellenőrizhető vagy nem teljesült.",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"acceptance_criteria": acceptance, "patch_files": files, "test_results": tests},
+                feedback=feedback,
+            )
+
+        return self._decision(
+            task_id,
+            status=self.ACCEPT,
+            iteration=iteration,
+            score=1.0,
+            summary="A patch megfelel a specifikációnak és a QA feltételeknek.",
+            reason="Nincs hiányzó fájl, nincs sikertelen teszt és az acceptancia kritériumok teljesülnek.",
+            missing_files=missing_files,
+            failing_tests=failing_tests,
+            passed_tests=passed_tests,
+            evidence={"patch_files": files, "test_results": tests},
+            feedback=feedback,
+        )
+
+    @staticmethod
+    def _normalize_patch_files(patch_files: dict[str, Any] | Sequence[str] | None) -> list[str]:
+        if patch_files is None:
+            return []
+        if isinstance(patch_files, Mapping):
+            return [str(k) for k in patch_files.keys()]
+        if isinstance(patch_files, (list, tuple, set)):
+            return [str(x) for x in patch_files]
+        return [str(patch_files)]
+
+    @staticmethod
+    def _normalize_test_results(test_results: dict[str, Any] | None) -> dict[str, Any]:
+        if test_results is None:
             return {}
+        if isinstance(test_results, Mapping):
+            return dict(test_results)
+        return {"raw": test_results}
+
+    @staticmethod
+    def _as_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [str(x) for x in value]
+        return [str(value)]
+
+    @staticmethod
+    def _missing_required_files(patch_files: list[str], required_files: list[str]) -> list[str]:
+        if not required_files:
+            return []
+        return [f for f in required_files if not any(f == p or p.endswith(f) for p in patch_files)]
+
+    @staticmethod
+    def _missing_required_tests(test_results: Mapping[str, Any], required_tests: list[str]) -> list[str]:
+        if not required_tests:
+            return []
+        names = []
+        for key in test_results:
+            if isinstance(test_results[key], Mapping):
+                names.append(str(test_results[key].get("name") or key))
+            else:
+                names.append(str(key))
+        return [name for name in required_tests if name not in names]
+
+    @staticmethod
+    def _failing_tests(test_results: Mapping[str, Any]) -> list[str]:
+        names: list[str] = []
+        for key, value in test_results.items():
+            if isinstance(value, Mapping):
+                outcome = value.get("status") or value.get("result") or value.get("passed")
+                name = str(value.get("name") or key)
+            else:
+                outcome = value
+                name = str(key)
+
+            if isinstance(outcome, bool):
+                if not outcome:
+                    names.append(name)
+            elif isinstance(outcome, str):
+                lowered = outcome.lower()
+                if lowered in {"failed", "error", "fail", "failure", "broken", "timeout"}:
+                    names.append(name)
+        return names
+
+    @staticmethod
+    def _passed_tests(test_results: Mapping[str, Any]) -> list[str]:
+        names: list[str] = []
+        for key, value in test_results.items():
+            if isinstance(value, Mapping):
+                outcome = value.get("status") or value.get("result") or value.get("passed")
+                name = str(value.get("name") or key)
+            else:
+                outcome = value
+                name = str(key)
+
+            if isinstance(outcome, bool):
+                if outcome:
+                    names.append(name)
+            elif isinstance(outcome, str):
+                lowered = outcome.lower()
+                if lowered in {"pass", "passed", "ok", "success", "successfully"}:
+                    names.append(name)
+        return names
+
+    @staticmethod
+    def _acceptance_met(acceptance: list[str], files: list[str], tests: Mapping[str, Any]) -> bool:
+        if not acceptance:
+            return True
+        if not files and not tests:
+            return False
+        for criterion in acceptance:
+            text = str(criterion).lower()
+            if "file" in text and not files:
+                return False
+            if "test" in text and not tests:
+                return False
+        return True
+
+    @staticmethod
+    def _decision(
+        task_id: str,
+        *,
+        status: str,
+        iteration: int,
+        score: float,
+        summary: str,
+        reason: str,
+        missing_files: list[str],
+        failing_tests: list[str],
+        passed_tests: list[str],
+        evidence: dict[str, Any],
+        feedback: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "task_id": task_id,
+            "status": status,
+            "iteration": iteration,
+            "score": round(max(0.0, min(1.0, float(score))), 3),
+            "summary": summary,
+            "reason": reason,
+            "missing_files": missing_files,
+            "failing_tests": failing_tests,
+            "passed_tests": passed_tests,
+            "evidence": evidence,
+            "feedback": feedback,
+        }
+
+
+DEFAULT_QA = QA
+
+
+if __name__ == "__main__":
+    qa = QA()
+    print(
+        qa.run(
+            "TASK-001",
+            {"required_files": ["factory/qa.py"], "acceptance_criteria": ["patch file", "tests pass"]},
+            {"factory/qa.py": "ok"},
+            {"pytest": True},
+            iteration=1,
+        )
+    )
