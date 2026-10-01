@@ -2,9 +2,14 @@
 
 A klasszifikáció egyszerű, determinisztikus és nem LLM-függő. A cél az, hogy
 minden feladat kapjon egy alapszintű kockázati besorolást a Supervisor számára.
+
+S1 = kis és alacsony kockázatú feladat (docs, lint, typo, small fix)
+S2 = nagyobb/kockázatosabb feladat (security, refactor, schema, infra, deploy)
 """
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Mapping
 
 
@@ -17,6 +22,7 @@ class LaneClassifier:
         "format",
         "doc",
         "docs",
+        "documentation",
         "readme",
         "comment",
         "lint",
@@ -28,11 +34,15 @@ class LaneClassifier:
         "message",
         "error text",
         "fix warning",
+        "whitespace",
+        "formatting",
     )
 
     S2_HINTS = (
         "security",
         "auth",
+        "authentication",
+        "authorization",
         "permission",
         "privilege",
         "secret",
@@ -47,12 +57,18 @@ class LaneClassifier:
         "schema",
         "pipeline",
         "infra",
+        "infrastructure",
         "deploy",
+        "deployment",
         "ops",
+        "operations",
         "gateway",
         "sandbox",
         "audit",
         "state",
+        "performance",
+        "critical",
+        "high-risk",
     )
 
     def classify(self, task: Mapping[str, Any] | str | None, *, default: str = "S2") -> str:
@@ -105,15 +121,18 @@ class LaneClassifier:
         return default if default in {"S1", "S2"} else "S2"
 
     def classify_task(self, task: Mapping[str, Any] | str | None, *, default: str = "S2") -> str:
+        """Publikus interfész a feladat besorolásához."""
         return self.classify(task, default=default)
 
     def __call__(self, task: Mapping[str, Any] | str | None, *, default: str = "S2") -> str:
+        """Callable interfész."""
         return self.classify(task, default=default)
 
     @staticmethod
     def _collect_text(data: Mapping[str, Any]) -> str:
+        """Szöveg összegyűjtése az összes releváns mezőből."""
         chunks: list[str] = []
-        for key in ("title", "summary", "description", "text", "prompt", "spec", "message", "reason"):
+        for key in ("title", "summary", "description", "text", "prompt", "spec", "message", "reason", "requirement"):
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 chunks.append(value)
@@ -125,6 +144,7 @@ class LaneClassifier:
 
     @staticmethod
     def _as_list(value: Any) -> list[str]:
+        """Érték normalizálása listává."""
         if value is None:
             return []
         if isinstance(value, (list, tuple, set)):
@@ -136,5 +156,7 @@ DEFAULT_LANE_CLASSIFIER = LaneClassifier()
 
 
 if __name__ == "__main__":
-    print(DEFAULT_LANE_CLASSIFIER.classify("Fix typo in README"))
-    print(DEFAULT_LANE_CLASSIFIER.classify("Add OAuth login flow with security checks"))
+    print("S1:", DEFAULT_LANE_CLASSIFIER.classify("Fix typo in README"))
+    print("S2:", DEFAULT_LANE_CLASSIFIER.classify("Add OAuth login flow with security checks"))
+    print("S1:", DEFAULT_LANE_CLASSIFIER.classify({"text": "Update docs", "size": "small"}))
+    print("S2:", DEFAULT_LANE_CLASSIFIER.classify({"text": "Refactor auth module", "files": ["auth.py", "token.py", "session.py"]}))
