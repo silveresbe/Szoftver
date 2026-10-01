@@ -1,0 +1,67 @@
+"""Autofix (LLM nélkül): biztonságos, diff-alapú javítások a kapuk előtt.
+
+A 0. fázisban a cél az, hogy a patch által érintett .py fájlokon a legkisebb kockázatú,
+megbízható javítások automatikusan lefussanak, anélkül hogy a Coder által beküldött patchet
+újra LLM-vel módosítanánk.
+
+A valódi környezetben ez `ruff format` + `ruff check --fix` hívásokból áll. Mock környezetben
+biztonságosan NOOP-ként tér vissza, hogy a rendszer ne törjön el a hiányzó eszközök miatt.
+"""
+from __future__ import annotations
+
+import json
+import os
+from typing import Iterable
+
+
+class Autofix:
+    """LLM-nélküli javítás a kapuk elé, csak a patch által módosított fájlokra."""
+
+    def __init__(self, cfg: dict | None = None, sandbox=None, audit=None, root: str = "."):
+        self.cfg = cfg or {}
+        self.sandbox = sandbox
+        self.audit = audit
+        self.root = root
+
+    def run(self, task_id: str, files: Iterable[str], created: Iterable[str] | None = None) -> dict:
+        """Visszaadja a javítás állapotát.
+
+        Várt forma:
+          {"status": "FIXED" | "NOOP" | "FAILED",
+           "files": [...],
+           "created": [...],
+           "changes": {...}}
+        """
+        files = [str(f) for f in files if str(f).strip()]
+        created = [str(f) for f in (created or ()) if str(f).strip()]
+        if not files:
+            return {"status": "NOOP", "files": [], "created": created, "changes": {}}
+
+        # Determinisztikus, biztonságos fallback: ha nincs sandbox, ne provokáljuk a rendszer bukását.
+        if self.sandbox is None:
+            return {"status": "NOOP", "files": files, "created": created, "changes": {}}
+
+        valid = [f for f in files if f.endswith(".py")]
+        if not valid:
+            return {"status": "NOOP", "files": files, "created": created, "changes": {}}
+
+        try:
+            # A valós környezetben a kapuk és a sandbox segítségével lefuttatjuk a biztonságos autofixet.
+            # A 0. fázisba ez a mock-safe fallback miatt a biztos, nem-bukó utat adja.
+            rc, out = self.sandbox.run(["python", "-m", "ruff", "check", "--fix", "--exit-zero", "--output-format=concise", *valid], worktree=self.root)
+            if rc in (0, 1):
+                if self.audit:
+                    self.audit.append("autofix", "AUTOFIX_OK", {"task_id": task_id, "files": valid, "rc": rc})
+                return {"status": "FIXED", "files": valid, "created": created, "changes": {"ruff_fix_rc": rc, "output": (out or "")[:2000]}}
+            return {"status": "FAILED", "files": valid, "created": created, "changes": {"error": (out or "")[:2000]}}
+        except Exception as e:
+            if self.audit:
+                self.audit.append("autofix", "AUTOFIX_EXCEPTION", {"task_id": task_id, "files": valid, "error": str(e)[:200]})
+            return {"status": "FAILED", "files": valid, "created": created, "changes": {"error": str(e)[:200]}}
+
+
+DEFAULT_AUTOFIX = Autofix
+
+
+if __name__ == "__main__":
+    print(Autofix().run("demo", ["src/demo.py"], created=[]))
