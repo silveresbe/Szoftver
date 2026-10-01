@@ -60,13 +60,16 @@ def _norm(path):
     """(normalizált relatív útvonal, hiba)."""
     if not isinstance(path, str) or not path.strip():
         return None, "üres útvonal"
-    if "\x00" in path or "\\" in path or path != path.strip():
+    if "\x00" in path or path != path.strip():
         return None, "tiltott karakter az útvonalban"
-    if os.path.isabs(path) or re.match(r"^[A-Za-z]:", path):
+    # A repo az útvonalakat relatív, '/'-al vagy '\\'-el is elfogadja, de a belső formátum mindig normalizált,
+    # a Windows-os, fájlnévtérrel való path-mátrix miatt. A relatív útvonal soha ne tartalmazzon abszolút prefixedet.
+    raw = path.replace("\\", "/")
+    if raw.startswith("/") or raw.startswith("//") or re.match(r"^[A-Za-z]:", raw):
         return None, "abszolút útvonal"
-    if path.endswith("/"):
+    if raw.endswith("/"):
         return None, "könyvtár, nem fájl"
-    p = os.path.normpath(path).replace(os.sep, "/")
+    p = os.path.normpath(raw).replace("\\", "/")
     if p in (".", "..") or p.startswith("../"):
         return None, "kilépés a munkakönyvtárból"
     return p, None
@@ -75,6 +78,13 @@ def _norm(path):
 def norm_path(path):
     """Nyilvános: (normalizált relatív útvonal, hiba) - ugyanazok a szabályok, mint az írásnál."""
     return _norm(path)
+
+
+def _canon_path(path):
+    """A valós és a hozzárendelt útvonal összehasonlításához ugyanaz a normalizálás kell mindkét oldalon."""
+    if path is None:
+        return None
+    return os.path.normcase(os.path.normpath(path))
 
 
 def read_file(root, rel, limits=None):
@@ -86,8 +96,8 @@ def read_file(root, rel, limits=None):
         return None, ("BAD_PATH", e)
     if any(part.lower() == ".git" for part in rel_n.split("/")):
         return None, ("DENIED", ".git tiltott")
-    expected = os.path.join(os.path.realpath(root), rel_n)
-    if os.path.realpath(expected) != expected:
+    expected = os.path.normpath(os.path.join(os.path.realpath(root), rel_n))
+    if _canon_path(os.path.realpath(expected)) != _canon_path(expected):
         return None, ("BAD_PATH", "szimbolikus link vagy a munkakönyvtárból kilépő útvonal")
     if not os.path.lexists(expected):
         return None, ("NOT_FOUND", "a fájl nem létezik")
@@ -109,8 +119,8 @@ def _access(rel, tools, agent, audit, real_root):
         tools.authorize(agent, "repo_write", rel)        # jogosultság + védett zóna + kill switch (Killed továbbmegy)
     except ToolDenied:
         return "DENIED", "nincs jogosultság vagy védett zóna"
-    expected = os.path.join(real_root, rel)
-    if os.path.realpath(expected) != expected:
+    expected = os.path.normpath(os.path.join(real_root, rel))
+    if _canon_path(os.path.realpath(expected)) != _canon_path(expected):
         return "BAD_PATH", "szimbolikus link vagy a munkakönyvtárból kilépő útvonal"
     return None
 
@@ -176,7 +186,7 @@ def hunk_context(text, search, radius=5, max_chars=1200):
 def _edit(text, search, replace):
     """(új szöveg, hiba). Hiba: (kód, részlet, context)."""
     if "\r\n" in text and text.count("\n") == text.count("\r\n") and "\r" not in search and "\r" not in replace:
-        search, replace = search.replace("\n", "\r\n"), replace.replace("\n", "\r\n")     # CRLF-fájl
+        search, replace = search.replace("\n", "\r\n"), replace.replace("\n", "\r\n")  # CRLF-fájl
     first = text.find(search)
     if first < 0:
         return None, ("SEARCH_NOT_FOUND", "a 'search' szöveg nem található a fájlban", hunk_context(text, search))
