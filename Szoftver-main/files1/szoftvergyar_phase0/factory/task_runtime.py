@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .qa import QA
+from .supervisor import Supervisor
 from .task_state import TASK_STATES, TaskStateMachine
 
 
@@ -24,6 +26,23 @@ class TaskRuntimeDecision:
     summary: str
     reason: str
     route: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TaskWorkflowResult:
+    task_id: str
+    current_state: str
+    next_state: str
+    next_action: str
+    recipient: str
+    qa_status: str
+    score: float
+    summary: str
+    reason: str
+    route: str = ""
+    qa_result: dict[str, Any] = field(default_factory=dict)
+    supervisor_route: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -60,8 +79,6 @@ class TaskRuntime:
         if current_state not in TaskStateMachine.valid_states():
             raise ValueError(f"ismeretlen állapot: {current_state}")
 
-        # A QA review előtt kötelező, hogy a task már a QA_REVIEW fázisban legyen.
-        # Ha nem, a runtime explicit, validált átmenetként kezeli.
         if current_state == TASK_STATES["IN_PROGRESS"]:
             current_state = TaskStateMachine.transition(current_state, "QA_REVIEW")
 
@@ -97,8 +114,66 @@ class TaskRuntime:
             metadata=metadata,
         )
 
+    @staticmethod
+    def run_workflow(
+        task_id: str,
+        spec: dict[str, Any],
+        patch_files: dict[str, Any] | list[str] | tuple[str, ...] | None,
+        test_results: dict[str, Any] | None,
+        *,
+        current_state: str = TASK_STATES["IN_PROGRESS"],
+        iteration: int = 0,
+        actor: str = "supervisor",
+    ) -> TaskWorkflowResult:
+        """Végigfuttatja a teljes QA → Supervisor pipeline-t egy taskhez."""
+        if current_state not in TaskStateMachine.valid_states():
+            raise ValueError(f"ismeretlen állapot: {current_state}")
 
-__all__ = ["TaskRuntimeDecision", "TaskRuntime"]
+        qa = QA()
+        qa_result = qa.run(
+            task_id=task_id,
+            spec=dict(spec),
+            patch_files=patch_files,
+            test_results=test_results,
+            iteration=iteration,
+        )
+
+        supervisor = Supervisor()
+        routed = supervisor.route_qa_decision(task_id, qa_result, iteration=iteration, actor=actor)
+        decision = TaskRuntime.normalize_decision(qa_result)
+
+        if current_state == TASK_STATES["IN_PROGRESS"]:
+            current_state = TaskStateMachine.transition(current_state, "QA_REVIEW")
+
+        if routed["state"] == TASK_STATES["ACCEPTED"]:
+            route = "accepted"
+        elif routed["state"] == TASK_STATES["REJECTED"]:
+            route = "revision_required"
+        else:
+            route = "needs_info"
+
+        return TaskWorkflowResult(
+            task_id=task_id,
+            current_state=current_state,
+            next_state=routed["state"],
+            next_action=routed["next_action"],
+            recipient=routed["recipient"],
+            qa_status=decision,
+            score=float(qa_result.get("score", 0.0) or 0.0),
+            summary=str(qa_result.get("summary") or "QA review completed."),
+            reason=str(qa_result.get("reason") or "No reason provided."),
+            route=route,
+            qa_result=qa_result,
+            supervisor_route=routed,
+            metadata={
+                "iteration": iteration,
+                "actor": actor,
+                "source_state": current_state,
+            },
+        )
+
+
+__all__ = ["TaskRuntimeDecision", "TaskWorkflowResult", "TaskRuntime"]
 
 
 if __name__ == "__main__":
@@ -110,3 +185,13 @@ if __name__ == "__main__":
         reason="meets criteria",
     )
     print(d)
+
+    wf = TaskRuntime.run_workflow(
+        "TASK-2",
+        {"required_files": ["factory/qa.py"], "acceptance_criteria": ["patch file", "tests pass"]},
+        {"factory/qa.py": "ok"},
+        {"unit": True},
+        current_state=TASK_STATES["IN_PROGRESS"],
+        iteration=1,
+    )
+    print(wf)
