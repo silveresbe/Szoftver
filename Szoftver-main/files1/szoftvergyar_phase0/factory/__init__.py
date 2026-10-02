@@ -4,6 +4,7 @@ from .handoff_flow import DEFAULT_HANDOFF_FLOW, HandoffFlow
 from .qa import QA
 from .supervisor import Supervisor
 from .task_state import TaskStateMachine
+from .workflow_orchestrator import DEFAULT_ORCHESTRATOR, WorkflowOrchestrator, TaskWorkflowResult
 
 __version__ = "0.1.0"
 
@@ -11,6 +12,9 @@ __all__ = [
     "__version__",
     "HandoffFlow",
     "DEFAULT_HANDOFF_FLOW",
+    "WorkflowOrchestrator",
+    "DEFAULT_ORCHESTRATOR",
+    "TaskWorkflowResult",
     "QA",
     "Supervisor",
     "TaskStateMachine",

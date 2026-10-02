@@ -10,6 +10,8 @@ from factory.lane_classifier import LaneClassifier
 from factory.qa import QA
 from factory.supervisor import Supervisor
 from factory.task_runtime import TaskRuntime
+from factory.task_state import TASK_STATES
+from factory.workflow_orchestrator import WorkflowOrchestrator
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 with open(os.path.join(ROOT, "factory.yaml")) as _f:
@@ -78,6 +80,112 @@ class TestRuntimeWorkflow(unittest.TestCase):
         )
         self.assertEqual(result.next_state, "REJECTED")
         self.assertEqual(result.recipient, "master_coder")
+
+
+class TestWorkflowOrchestrator(unittest.TestCase):
+    def test_orchestrator_complete_accept_flow(self):
+        orch = WorkflowOrchestrator()
+        result = orch.run(
+            "T-300",
+            {
+                "required_files": ["factory/qa.py"],
+                "acceptance_criteria": ["patch file", "tests pass"],
+                "stories": [{"id": "S-1", "title": "test"}],
+                "scope_in": ["QA module"],
+                "scope_out": ["deployment"],
+                "assumptions": [{"text": "python 3.10+", "needs_confirmation": True}],
+            },
+            {"factory/qa.py": "ok"},
+            {"unit": True},
+            current_state=TASK_STATES["IN_PROGRESS"],
+            iteration=1,
+        )
+        self.assertEqual(result.next_state, TASK_STATES["ACCEPTED"])
+        self.assertEqual(result.next_action, "handoff_to_owner")
+        self.assertEqual(result.recipient, "product_owner")
+        self.assertEqual(result.route, "accepted")
+
+    def test_orchestrator_reject_flow(self):
+        orch = WorkflowOrchestrator()
+        result = orch.run(
+            "T-301",
+            {
+                "required_files": ["factory/qa.py"],
+                "acceptance_criteria": ["patch file", "tests pass"],
+                "stories": [{"id": "S-1", "title": "test"}],
+                "scope_in": ["QA module"],
+                "scope_out": ["deployment"],
+                "assumptions": [{"text": "python 3.10+", "needs_confirmation": True}],
+            },
+            {"factory/qa.py": "ok"},
+            {"unit": False},
+            current_state=TASK_STATES["IN_PROGRESS"],
+            iteration=1,
+        )
+        self.assertEqual(result.next_state, TASK_STATES["REJECTED"])
+        self.assertEqual(result.recipient, "master_coder")
+        self.assertEqual(result.route, "revision_required")
+
+    def test_orchestrator_needs_info_escalation(self):
+        orch = WorkflowOrchestrator()
+        result = orch.run(
+            "T-302",
+            {
+                "required_files": ["factory/qa.py"],
+                "acceptance_criteria": ["patch file", "tests pass"],
+                "stories": [{"id": "S-1", "title": "test"}],
+                "scope_in": ["QA module"],
+                "scope_out": ["deployment"],
+                "assumptions": [{"text": "python 3.10+", "needs_confirmation": True}],
+            },
+            {"factory/qa.py": "ok"},
+            {},  # no test results
+            current_state=TASK_STATES["IN_PROGRESS"],
+            iteration=1,
+        )
+        self.assertEqual(result.next_state, TASK_STATES["HUMAN_ESCALATION"])
+        self.assertEqual(result.recipient, "human")
+
+    def test_orchestrator_human_continue_resolution(self):
+        orch = WorkflowOrchestrator()
+        result = orch.run(
+            "T-303",
+            {
+                "required_files": ["factory/qa.py"],
+                "acceptance_criteria": ["patch file", "tests pass"],
+                "stories": [{"id": "S-1", "title": "test"}],
+                "scope_in": ["QA module"],
+                "scope_out": ["deployment"],
+                "assumptions": [{"text": "python 3.10+", "needs_confirmation": True}],
+            },
+            {"factory/qa.py": "ok"},
+            {},
+            current_state=TASK_STATES["IN_PROGRESS"],
+            iteration=1,
+            human_decision="CONTINUE",
+        )
+        self.assertEqual(result.next_state, TASK_STATES["PENDING"])
+        self.assertIn("human_escalation_resolved", result.route)
+
+    def test_orchestrator_human_halt_resolution(self):
+        orch = WorkflowOrchestrator()
+        result = orch.run(
+            "T-304",
+            {
+                "required_files": ["factory/qa.py"],
+                "acceptance_criteria": ["patch file", "tests pass"],
+                "stories": [{"id": "S-1", "title": "test"}],
+                "scope_in": ["QA module"],
+                "scope_out": ["deployment"],
+                "assumptions": [{"text": "python 3.10+", "needs_confirmation": True}],
+            },
+            {"factory/qa.py": "ok"},
+            {},
+            current_state=TASK_STATES["IN_PROGRESS"],
+            iteration=1,
+            human_decision="HALT",
+        )
+        self.assertEqual(result.next_state, TASK_STATES["HALTED"])
 
 
 class TestLaneClassifier(unittest.TestCase):
