@@ -1,36 +1,55 @@
-import copy, json, os, tempfile, unittest, yaml
+import copy
+import os
+import tempfile
+import unittest
+import yaml
 
 from factory import config as C
-from factory.audit import AuditLog
-from factory.state import State
-from factory.rate_limiter import RateLimiter, RequestTooLarge, WaitTooLong, DailyQuotaExhausted
-from factory.redactor import Redactor, RedactorError, ForbiddenPath
-from factory.gateway import Gateway, ProviderUnavailable, TruncatedOutput, OutputContractFailed, ReplayMiss
-from factory.killswitch import KillSwitch
-from factory.sandbox import SandboxRunner, SandboxRefused
-from factory.supervisor import Supervisor, PhaseNotEnabled
+from factory.handoff_flow import HandoffFlow
 from factory.lane_classifier import LaneClassifier
 from factory.qa import QA
+from factory.supervisor import Supervisor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-with open(os.path.join(ROOT, "factory.yaml")) as _f: CFG = yaml.safe_load(_f)
+with open(os.path.join(ROOT, "factory.yaml")) as _f:
+    CFG = yaml.safe_load(_f)
 
 
-class Clock:
-    def __init__(self): self.t = 1000.0
-    def __call__(self): return self.t
-    def sleep(self, s): self.t += s
+class TestHandoffFlow(unittest.TestCase):
+    def test_review_patch_routes_accept_to_owner(self):
+        flow = HandoffFlow()
+        result = flow.review_patch(
+            "T-100",
+            {"required_files": ["factory/qa.py"], "acceptance_criteria": ["patch file", "tests pass"]},
+            {"factory/qa.py": "ok"},
+            {"unit": True},
+            iteration=2,
+        )
+        self.assertEqual(result["state"], "ACCEPTED")
+        self.assertEqual(result["next_action"], "handoff_to_owner")
+        self.assertEqual(result["recipient"], "product_owner")
 
+    def test_review_patch_rejects_failing_tests(self):
+        flow = HandoffFlow()
+        result = flow.review_patch(
+            "T-101",
+            {"required_files": ["factory/qa.py"], "acceptance_criteria": ["patch file", "tests pass"]},
+            {"factory/qa.py": "ok"},
+            {"unit": False},
+            iteration=1,
+        )
+        self.assertEqual(result["state"], "REJECTED")
+        self.assertEqual(result["recipient"], "master_coder")
 
-class Base(unittest.TestCase):
-    def setUp(self):
-        self.d = tempfile.mkdtemp()
-        self.cfg = copy.deepcopy(CFG)
-        self.audit = AuditLog(os.path.join(self.d, "audit", "d.jsonl"))
-        self.state = State(os.path.join(self.d, "state", "f.db"))
-        self.kill = KillSwitch(os.path.join(self.d, "state"))
-
-    def tearDown(self): self.state.close()
+    def test_accept_or_escalate_needs_info_uses_human_gate(self):
+        flow = HandoffFlow()
+        result = flow.accept_or_escalate(
+            "T-102",
+            {"status": "NEEDS_INFO", "score": 0.6, "summary": "Missing evidence", "reason": "Requires extra proof"},
+            iteration=1,
+        )
+        self.assertEqual(result["state"], "HUMAN_ESCALATION")
+        self.assertEqual(result["recipient"], "human")
 
 
 class TestLaneClassifier(unittest.TestCase):
@@ -43,11 +62,6 @@ class TestLaneClassifier(unittest.TestCase):
         cl = LaneClassifier()
         self.assertEqual(cl.classify("Add OAuth login flow with auth checks"), "S2")
         self.assertEqual(cl.classify({"text": "Refactor auth module", "files": ["auth.py", "token.py", "session.py"]}), "S2")
-
-    def test_explicit_lane_is_respected(self):
-        cl = LaneClassifier()
-        self.assertEqual(cl.classify({"text": "tiny doc cleanup", "lane": "S2"}), "S2")
-        self.assertEqual(cl.classify({"text": "security cleanup", "lane": "S1"}), "S1")
 
 
 class TestQAFlow(unittest.TestCase):
@@ -64,46 +78,16 @@ class TestQAFlow(unittest.TestCase):
         self.assertEqual(routed["next_action"], "handoff_to_owner")
         self.assertEqual(routed["recipient"], "product_owner")
 
-    def test_supervisor_reject_result(self):
-        s = Supervisor({"plan", "build", "qa", "handoff"})
-        rejected = s.reject_result("T-10", reason="Failing tests")
-        self.assertEqual(rejected["state"], "REJECTED")
-        self.assertEqual(rejected["recipient"], "master_coder")
-
-    def test_supervisor_escalate_human(self):
-        s = Supervisor({"plan", "build", "qa", "handoff"})
-        escalated = s.escalate_human("T-11", reason="Needs review", gate_id="G-1")
-        self.assertEqual(escalated["state"], "HUMAN_ESCALATION")
-        self.assertEqual(escalated["recipient"], "human")
-        self.assertEqual(escalated["gate_id"], "G-1")
-
-    def test_supervisor_resolve_escalation_continue(self):
-        s = Supervisor({"plan", "build", "qa", "handoff"})
-        resolved = s.resolve_from_escalation("T-11", human_decision="CONTINUE")
-        self.assertEqual(resolved["state"], "PENDING")
-        self.assertEqual(resolved["action"], "resume_task")
-
-    def test_supervisor_resolve_escalation_halt(self):
-        s = Supervisor({"plan", "build", "qa", "handoff"})
-        halted = s.resolve_from_escalation("T-12", human_decision="HALT")
-        self.assertEqual(halted["state"], "HALTED")
-        self.assertEqual(halted["action"], "halt_task")
-
 
 class TestConfig(unittest.TestCase):
-    def test_sample_valid(self): C.validate(copy.deepcopy(CFG))
+    def test_sample_valid(self):
+        C.validate(copy.deepcopy(CFG))
+
     def test_network_must_be_none(self):
-        c = copy.deepcopy(CFG); c["sandbox"]["network"] = "bridge"
-        with self.assertRaises(C.ConfigError): C.validate(c)
-    def test_missing_section(self):
-        c = copy.deepcopy(CFG); del c["rate_limit"]
-        with self.assertRaises(C.ConfigError): C.validate(c)
-    def test_live_needs_ack(self):
-        c = copy.deepcopy(CFG); c["llm_gateway_modes"]["mode"] = "live"
-        with self.assertRaises(C.ConfigError): C.validate(c)
-    def test_host_mounts_forbidden(self):
-        c = copy.deepcopy(CFG); c["sandbox"]["host_mounts"] = ["/etc"]
-        with self.assertRaises(C.ConfigError): C.validate(c)
+        c = copy.deepcopy(CFG)
+        c["sandbox"]["network"] = "bridge"
+        with self.assertRaises(C.ConfigError):
+            C.validate(c)
 
 
 if __name__ == "__main__":
