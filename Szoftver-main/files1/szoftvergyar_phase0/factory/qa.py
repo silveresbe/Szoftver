@@ -37,26 +37,9 @@ class QA:
         iteration: int = 0,
         feedback: str | None = None,
     ) -> dict[str, Any]:
-        """Futtassa le a QA értékelést a feladathoz.
-
-        Visszatérési forma:
-        {
-            "task_id": ...,
-            "status": "ACCEPT|REJECT|NEEDS_INFO",
-            "iteration": ...,
-            "score": 0.0-1.0,
-            "summary": "...",
-            "reason": "...",
-            "missing_files": [...],
-            "failing_tests": [...],
-            "passed_tests": [...],
-            "evidence": {...},
-            "feedback": "..."
-        }
-        """
+        """Futtassa le a QA értékelést a feladathoz."""
         if not isinstance(spec, Mapping):
             raise QAError("spec must be a mapping / dict")
-
         if not task_id:
             raise QAError("task_id cannot be empty")
 
@@ -91,8 +74,7 @@ class QA:
                 task_id,
                 status=self.REJECT,
                 iteration=iteration,
-                score=max(0.0, 1.0 - (len(failing_tests) / max(1, len(failing_tests) + len(passed_tests))),
-                ),
+                score=max(0.0, 1.0 - (len(failing_tests) / max(1, len(failing_tests) + len(passed_tests)))),
                 summary="A patch nem felel meg a tesztkritériumoknak.",
                 reason=f"Hibás tesztek: {', '.join(failing_tests)}",
                 missing_files=missing_files,
@@ -145,6 +127,23 @@ class QA:
             evidence={"patch_files": files, "test_results": tests},
             feedback=feedback,
         )
+
+    def review(self, *args, **kwargs):
+        """Alias a run() metódushoz; a Supervisor és a QA grafikus layer kompatibilitásához."""
+        return self.run(*args, **kwargs)
+
+    def evaluate(self, *args, **kwargs):
+        """Alias a review() wrapperhez: strukturált QA döntés."""
+        return self.review(*args, **kwargs)
+
+    @staticmethod
+    def normalize_status(decision: str | Mapping[str, Any]) -> str:
+        """A QA döntés szöveges vagy dict formáját normalizálja érvényes statuszre."""
+        if isinstance(decision, Mapping):
+            value = str(decision.get("status") or decision.get("verdict") or QA.NEEDS_INFO).upper()
+        else:
+            value = str(decision).upper()
+        return value if value in {QA.ACCEPT, QA.REJECT, QA.NEEDS_INFO} else QA.NEEDS_INFO
 
     @staticmethod
     def _normalize_patch_files(patch_files: dict[str, Any] | Sequence[str] | None) -> list[str]:
@@ -277,6 +276,7 @@ class QA:
 
 
 DEFAULT_QA = QA
+__all__ = ["QA", "QAError", "DEFAULT_QA"]
 
 
 if __name__ == "__main__":
