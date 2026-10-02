@@ -1,165 +1,295 @@
-"""Supervisor integration: QA handoff, route selection and task state machine.
+"""QA review gate: determinisztikus elfogadási logika a patch-ekhez.
 
-Ez a modul köt össze három dolgot:
-- a QA eredményét,
-- a Supervisor döntését,
-- a task lifecycle explicit állapotátmeneteit.
+A QA modul a patchet a feladat specifikáció és a tesztfutás alapján értékeli. A
+cél a döntés egyszerű, reprodukálható formában történő visszaadása:
+- ACCEPT: a patch megfelel a kritériumoknak
+- REJECT: a patchet el kell utasítani
+- NEEDS_INFO: a QA további információt kér
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .messages import make as make_message
-from .task_state import TASK_STATES, TaskStateMachine
+
+class QAError(RuntimeError):
+    """A QA modulhoz tartozó determinisztikus hiba."""
 
 
-class PhaseNotEnabled(RuntimeError):
-    """A fázis nem engedélyezett a szakaszban."""
+class QA:
+    """A patch értékelő kapu. A QA a különböző köztes eredményeket egyetlen
+    strukturált döntéssé birodalítja.
+    """
 
+    ACCEPT = "ACCEPT"
+    REJECT = "REJECT"
+    NEEDS_INFO = "NEEDS_INFO"
 
-class Supervisor:
-    """Koordinátor a task lifecycle és a QA handoff között."""
-
-    ACCEPTED = TASK_STATES["ACCEPTED"]
-    REJECTED = TASK_STATES["REJECTED"]
-    NEEDS_INFO = TASK_STATES["NEEDS_INFO"]
-
-    def __init__(self, enabled_phases: set[str] | None = None, audit=None):
-        self.enabled_phases = enabled_phases or {"plan", "build", "qa", "handoff"}
+    def __init__(self, audit=None):
         self.audit = audit
 
-    def startup(self):
-        return {"status": "ok", "enabled_phases": sorted(self.enabled_phases)}
-
-    def check_phase(self, phase: str) -> bool:
-        """Ellenőrzi, hogy a fázis engedélyezett-e."""
-        if phase not in self.enabled_phases:
-            raise PhaseNotEnabled(f"phase '{phase}' is not enabled")
-        return True
-
-    def route_qa_decision(
+    def run(
         self,
         task_id: str,
-        qa_result: Mapping[str, Any],
-        *,
+        spec: dict[str, Any],
+        patch_files: dict[str, Any] | Sequence[str] | None,
+        test_results: dict[str, Any] | None = None,
         iteration: int = 0,
-        actor: str = "supervisor",
+        feedback: str | None = None,
     ) -> dict[str, Any]:
-        """QA döntését fordítja állapotgépi route-ra és üzenetre."""
+        """Futtassa le a QA értékelést a feladathoz.
+
+        Visszatérési forma:
+        {
+            "task_id": ...,
+            "status": "ACCEPT|REJECT|NEEDS_INFO",
+            "iteration": ...,
+            "score": 0.0-1.0,
+            "summary": "...",
+            "reason": "...",
+            "missing_files": [...],
+            "failing_tests": [...],
+            "passed_tests": [...],
+            "evidence": {...},
+            "feedback": "..."
+        }
+        """
+        if not isinstance(spec, Mapping):
+            raise QAError("spec must be a mapping / dict")
+
         if not task_id:
-            raise ValueError("task_id cannot be empty")
+            raise QAError("task_id cannot be empty")
 
-        state, next_action, recipient = TaskStateMachine.qa_decision_to_state(qa_result)
-        score = float((qa_result or {}).get("score", 0.0) or 0.0)
-        summary = str((qa_result or {}).get("summary") or "QA review completed.")
-        reason = str((qa_result or {}).get("reason") or "No reason provided.")
+        files = self._normalize_patch_files(patch_files)
+        tests = self._normalize_test_results(test_results)
+        required_files = self._as_list(spec.get("required_files") or spec.get("files") or spec.get("must_modify"))
+        required_tests = self._as_list(spec.get("required_tests") or spec.get("tests"))
+        acceptance = self._as_list(spec.get("acceptance_criteria"))
 
-        if state == self.ACCEPTED:
-            payload = {
-                "task_id": task_id,
-                "status": "ACCEPT",
-                "score": score,
-                "summary": summary,
-                "reason": reason,
-                "decision": "accept",
-            }
-        elif state == self.REJECTED:
-            payload = {
-                "task_id": task_id,
-                "status": "REJECT",
-                "score": score,
-                "summary": summary,
-                "reason": reason,
-                "decision": "reject",
-                "required_fix": "inspect_qa_failures",
-            }
-        else:
-            payload = {
-                "task_id": task_id,
-                "status": "NEEDS_INFO",
-                "score": score,
-                "summary": summary,
-                "reason": reason,
-                "decision": "needs_info",
-                "required_input": (qa_result or {}).get("evidence") or {},
-            }
+        missing_files = self._missing_required_files(files, required_files)
+        missing_tests = self._missing_required_tests(tests, required_tests)
+        failing_tests = self._failing_tests(tests)
+        passed_tests = self._passed_tests(tests)
 
-        message = make_message(
-            task_id=task_id,
-            frm=actor,
-            to=recipient,
-            mtype="QA_HANDOFF",
-            payload=payload,
+        if missing_files:
+            return self._decision(
+                task_id,
+                status=self.REJECT,
+                iteration=iteration,
+                score=0.0,
+                summary="A patch hiányzó fájlokat nem tartalmaz.",
+                reason=f"Hiányzó fájlok: {', '.join(missing_files)}",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"required_files": required_files, "patch_files": files},
+                feedback=feedback,
+            )
+
+        if failing_tests:
+            return self._decision(
+                task_id,
+                status=self.REJECT,
+                iteration=iteration,
+                score=max(0.0, 1.0 - (len(failing_tests) / max(1, len(failing_tests) + len(passed_tests)))),
+                summary="A patch nem felel meg a tesztkritériumoknak.",
+                reason=f"Hibás tesztek: {', '.join(failing_tests)}",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"test_results": tests, "acceptance_criteria": acceptance},
+                feedback=feedback,
+            )
+
+        if missing_tests:
+            return self._decision(
+                task_id,
+                status=self.NEEDS_INFO,
+                iteration=iteration,
+                score=0.5,
+                summary="A patch még hiányzik a kötelező ellenőrzésekhez.",
+                reason=f"Hiányzó kötelező tesztek: {', '.join(missing_tests)}",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"required_tests": required_tests, "test_results": tests},
+                feedback=feedback,
+            )
+
+        if acceptance and not self._acceptance_met(acceptance, files, tests):
+            return self._decision(
+                task_id,
+                status=self.NEEDS_INFO,
+                iteration=iteration,
+                score=0.6,
+                summary="A patch nem teljesíti az explicit acceptancia kritériumokat.",
+                reason="Néhány acceptancia feltétel nem ellenőrizhető vagy nem teljesült.",
+                missing_files=missing_files,
+                failing_tests=failing_tests,
+                passed_tests=passed_tests,
+                evidence={"acceptance_criteria": acceptance, "patch_files": files, "test_results": tests},
+                feedback=feedback,
+            )
+
+        return self._decision(
+            task_id,
+            status=self.ACCEPT,
             iteration=iteration,
-            state=state,
-            action=next_action,
+            score=1.0,
+            summary="A patch megfelel a specifikációnak és a QA feltételeknek.",
+            reason="Nincs hiányzó fájl, nincs sikertelen teszt és az acceptancia kritériumok teljesülnek.",
+            missing_files=missing_files,
+            failing_tests=failing_tests,
+            passed_tests=passed_tests,
+            evidence={"patch_files": files, "test_results": tests},
+            feedback=feedback,
         )
 
+    def decision(self, *args, **kwargs):
+        """Alias a QA run() metódushoz; a Supervisor handoff kompatibilitásához."""
+        return self.run(*args, **kwargs)
+
+    @staticmethod
+    def _normalize_patch_files(patch_files: dict[str, Any] | Sequence[str] | None) -> list[str]:
+        if patch_files is None:
+            return []
+        if isinstance(patch_files, Mapping):
+            return [str(k) for k in patch_files.keys()]
+        if isinstance(patch_files, (list, tuple, set)):
+            return [str(x) for x in patch_files]
+        return [str(patch_files)]
+
+    @staticmethod
+    def _normalize_test_results(test_results: dict[str, Any] | None) -> dict[str, Any]:
+        if test_results is None:
+            return {}
+        if isinstance(test_results, Mapping):
+            return dict(test_results)
+        return {"raw": test_results}
+
+    @staticmethod
+    def _as_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [str(x) for x in value]
+        return [str(value)]
+
+    @staticmethod
+    def _missing_required_files(patch_files: list[str], required_files: list[str]) -> list[str]:
+        if not required_files:
+            return []
+        return [f for f in required_files if not any(f == p or p.endswith(f) for p in patch_files)]
+
+    @staticmethod
+    def _missing_required_tests(test_results: Mapping[str, Any], required_tests: list[str]) -> list[str]:
+        if not required_tests:
+            return []
+        names = []
+        for key in test_results:
+            if isinstance(test_results[key], Mapping):
+                names.append(str(test_results[key].get("name") or key))
+            else:
+                names.append(str(key))
+        return [name for name in required_tests if name not in names]
+
+    @staticmethod
+    def _failing_tests(test_results: Mapping[str, Any]) -> list[str]:
+        names: list[str] = []
+        for key, value in test_results.items():
+            if isinstance(value, Mapping):
+                outcome = value.get("status") or value.get("result") or value.get("passed")
+                name = str(value.get("name") or key)
+            else:
+                outcome = value
+                name = str(key)
+
+            if isinstance(outcome, bool):
+                if not outcome:
+                    names.append(name)
+            elif isinstance(outcome, str):
+                lowered = outcome.lower()
+                if lowered in {"failed", "error", "fail", "failure", "broken", "timeout"}:
+                    names.append(name)
+        return names
+
+    @staticmethod
+    def _passed_tests(test_results: Mapping[str, Any]) -> list[str]:
+        names: list[str] = []
+        for key, value in test_results.items():
+            if isinstance(value, Mapping):
+                outcome = value.get("status") or value.get("result") or value.get("passed")
+                name = str(value.get("name") or key)
+            else:
+                outcome = value
+                name = str(key)
+
+            if isinstance(outcome, bool):
+                if outcome:
+                    names.append(name)
+            elif isinstance(outcome, str):
+                lowered = outcome.lower()
+                if lowered in {"pass", "passed", "ok", "success", "successfully"}:
+                    names.append(name)
+        return names
+
+    @staticmethod
+    def _acceptance_met(acceptance: list[str], files: list[str], tests: Mapping[str, Any]) -> bool:
+        if not acceptance:
+            return True
+        if not files and not tests:
+            return False
+        for criterion in acceptance:
+            text = str(criterion).lower()
+            if "file" in text and not files:
+                return False
+            if "test" in text and not tests:
+                return False
+        return True
+
+    @staticmethod
+    def _decision(
+        task_id: str,
+        *,
+        status: str,
+        iteration: int,
+        score: float,
+        summary: str,
+        reason: str,
+        missing_files: list[str],
+        failing_tests: list[str],
+        passed_tests: list[str],
+        evidence: dict[str, Any],
+        feedback: str | None,
+    ) -> dict[str, Any]:
         return {
             "task_id": task_id,
-            "state": state,
-            "next_action": next_action,
-            "recipient": recipient,
-            "score": round(max(0.0, min(1.0, score)), 3),
+            "status": status,
+            "iteration": iteration,
+            "score": round(max(0.0, min(1.0, float(score))), 3),
             "summary": summary,
             "reason": reason,
-            "message": message,
-        }
-
-    def run_qa_handoff(
-        self,
-        task_id: str,
-        qa_result: Mapping[str, Any],
-        *,
-        iteration: int = 0,
-        actor: str = "supervisor",
-    ) -> dict[str, Any]:
-        """Alias a route_qa_decision számára; kompatibilitás miatt megtartva."""
-        return self.route_qa_decision(task_id, qa_result, iteration=iteration, actor=actor)
-
-    def transition(self, current_state: str, event: str) -> str:
-        """Explicit task state transition wrapper."""
-        return TaskStateMachine.transition(current_state, event)
-
-    def route_task(self, task_id: str, qa_result: Mapping[str, Any], *, iteration: int = 0, actor: str = "supervisor") -> dict[str, Any]:
-        """Végső task route: QA döntésének Supervisor hívása."""
-        result = self.route_qa_decision(task_id, qa_result, iteration=iteration, actor=actor)
-        if result["state"] == self.ACCEPTED:
-            return {
-                "task_id": task_id,
-                "route": "accepted",
-                "next_action": "handoff_to_owner",
-                "recipient": "product_owner",
-                "message": result["message"],
-            }
-        if result["state"] == self.REJECTED:
-            return {
-                "task_id": task_id,
-                "route": "revision_required",
-                "next_action": "return_for_revision",
-                "recipient": "master_coder",
-                "message": result["message"],
-            }
-        return {
-            "task_id": task_id,
-            "route": "needs_info",
-            "next_action": "request_clarification",
-            "recipient": "product_owner",
-            "message": result["message"],
+            "missing_files": missing_files,
+            "failing_tests": failing_tests,
+            "passed_tests": passed_tests,
+            "evidence": evidence,
+            "feedback": feedback,
         }
 
 
-DEFAULT_SUPERVISOR = Supervisor
+DEFAULT_QA = QA
 
 
 if __name__ == "__main__":
-    sup = Supervisor()
-    print(sup.startup())
+    qa = QA()
     print(
-        sup.route_qa_decision(
+        qa.run(
             "TASK-001",
-            {"status": "ACCEPT", "score": 1.0, "summary": "OK", "reason": "meets criteria"},
-            iteration=2,
+            {"required_files": ["factory/qa.py"], "acceptance_criteria": ["patch file", "tests pass"]},
+            {"factory/qa.py": "ok"},
+            {"pytest": True},
+            iteration=1,
         )
     )
