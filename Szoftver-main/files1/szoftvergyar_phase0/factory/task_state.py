@@ -112,13 +112,22 @@ class TaskStateMachine:
             return TASK_STATES["REJECTED"], "return_for_revision", "master_coder"
         return TASK_STATES["NEEDS_INFO"], "request_clarification", "product_owner"
 
+    @staticmethod
+    def route_from_decision(decision: str | Mapping[str, Any]) -> tuple[str, str, str]:
+        """Alias a qa_decision_to_state számára; a Supervisor és a QA közös API-nak része."""
+        return TaskStateMachine.qa_decision_to_state(decision)
+
+    @staticmethod
+    def decision_to_state(decision: str | Mapping[str, Any]) -> tuple[str, str, str]:
+        """Alias a route_from_decision számára; kompatibilitás a korábbi hívási mintákkal."""
+        return TaskStateMachine.qa_decision_to_state(decision)
+
 
 __all__ = [
     "TASK_STATES",
     "QA_DECISIONS",
     "STATE_TRANSITIONS",
     "TaskStateMachine",
-    "TaskStateMachineError",
     "TaskStateMachineError",
 ]
 
