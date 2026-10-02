@@ -1,25 +1,26 @@
 import copy, json, os, tempfile, unittest, yaml
-from factory import config as C, messages as M
-from factory.audit import AuditLog, AuditChainBroken
+
+from factory import config as C
+from factory.audit import AuditLog
 from factory.state import State
 from factory.rate_limiter import RateLimiter, RequestTooLarge, WaitTooLong, DailyQuotaExhausted
 from factory.redactor import Redactor, RedactorError, ForbiddenPath
 from factory.gateway import Gateway, ProviderUnavailable, TruncatedOutput, OutputContractFailed, ReplayMiss
-from factory.tool_gateway import ToolGateway, ToolDenied
-from factory.killswitch import KillSwitch, Killed
+from factory.killswitch import KillSwitch
 from factory.sandbox import SandboxRunner, SandboxRefused
 from factory.supervisor import Supervisor, PhaseNotEnabled
-from factory import ingress
 from factory.lane_classifier import LaneClassifier
 from factory.qa import QA
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 with open(os.path.join(ROOT, "factory.yaml")) as _f: CFG = yaml.safe_load(_f)
 
+
 class Clock:
     def __init__(self): self.t = 1000.0
     def __call__(self): return self.t
     def sleep(self, s): self.t += s
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -28,7 +29,9 @@ class Base(unittest.TestCase):
         self.audit = AuditLog(os.path.join(self.d, "audit", "d.jsonl"))
         self.state = State(os.path.join(self.d, "state", "f.db"))
         self.kill = KillSwitch(os.path.join(self.d, "state"))
+
     def tearDown(self): self.state.close()
+
 
 class TestLaneClassifier(unittest.TestCase):
     def test_easy_doc_fix_is_s1(self):
@@ -60,6 +63,31 @@ class TestQAFlow(unittest.TestCase):
         self.assertEqual(routed["state"], "ACCEPTED")
         self.assertEqual(routed["next_action"], "handoff_to_owner")
         self.assertEqual(routed["recipient"], "product_owner")
+
+    def test_supervisor_reject_result(self):
+        s = Supervisor({"plan", "build", "qa", "handoff"})
+        rejected = s.reject_result("T-10", reason="Failing tests")
+        self.assertEqual(rejected["state"], "REJECTED")
+        self.assertEqual(rejected["recipient"], "master_coder")
+
+    def test_supervisor_escalate_human(self):
+        s = Supervisor({"plan", "build", "qa", "handoff"})
+        escalated = s.escalate_human("T-11", reason="Needs review", gate_id="G-1")
+        self.assertEqual(escalated["state"], "HUMAN_ESCALATION")
+        self.assertEqual(escalated["recipient"], "human")
+        self.assertEqual(escalated["gate_id"], "G-1")
+
+    def test_supervisor_resolve_escalation_continue(self):
+        s = Supervisor({"plan", "build", "qa", "handoff"})
+        resolved = s.resolve_from_escalation("T-11", human_decision="CONTINUE")
+        self.assertEqual(resolved["state"], "PENDING")
+        self.assertEqual(resolved["action"], "resume_task")
+
+    def test_supervisor_resolve_escalation_halt(self):
+        s = Supervisor({"plan", "build", "qa", "handoff"})
+        halted = s.resolve_from_escalation("T-12", human_decision="HALT")
+        self.assertEqual(halted["state"], "HALTED")
+        self.assertEqual(halted["action"], "halt_task")
 
 
 class TestConfig(unittest.TestCase):
